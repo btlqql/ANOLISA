@@ -54,14 +54,32 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --branch)
+            # shift 2 with no value left fails under set -e and the script
+            # died silently; say what is missing instead.
+            if [[ $# -lt 2 ]]; then
+                echo "Option --branch requires a value" >&2
+                exit 1
+            fi
             BRANCH="$2"
             shift 2
             ;;
         --dir)
+            # shift 2 with no value left fails under set -e and the script
+            # died silently; say what is missing instead.
+            if [[ $# -lt 2 ]]; then
+                echo "Option --dir requires a value" >&2
+                exit 1
+            fi
             INSTALL_DIR="$2"
             shift 2
             ;;
         --hermes-home)
+            # shift 2 with no value left fails under set -e and the script
+            # died silently; say what is missing instead.
+            if [[ $# -lt 2 ]]; then
+                echo "Option --hermes-home requires a value" >&2
+                exit 1
+            fi
             HERMES_HOME="$2"
             shift 2
             ;;
