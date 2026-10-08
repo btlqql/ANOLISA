@@ -87,7 +87,9 @@ def strip_timestamp_prefix(text: str) -> str:
 
 def load_task_yaml(path: str) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        # yaml.safe_load returns None for an empty / comment-only document;
+        # normalise to {} so convert_session_to_trace can call task.get().
+        return yaml.safe_load(f) or {}
 
 
 def fetch_audit_data(task: dict, port_offset: int = 0) -> dict[str, dict]:
