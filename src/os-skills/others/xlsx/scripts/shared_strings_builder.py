@@ -30,6 +30,12 @@ Notes:
 import sys
 import html
 import argparse
+import re
+
+# XML 1.0 cannot represent most C0 control characters (only \t \n \r are
+# allowed); html.escape() passes them through and the generated file fails
+# every XML parser, including xlsx_pack's validator.
+_XML_ILLEGAL_C0 = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -40,7 +46,10 @@ def escape_text(s: str) -> tuple[str, bool]:
     """
     Return (escaped_text, needs_preserve).
     needs_preserve is True if the string has leading or trailing whitespace.
+    Characters XML 1.0 cannot represent are dropped (they would otherwise
+    make the whole sharedStrings.xml unparseable).
     """
+    s = _XML_ILLEGAL_C0.sub("", s)
     escaped = html.escape(s, quote=False)
     needs_preserve = s != s.strip()
     return escaped, needs_preserve
@@ -71,7 +80,9 @@ def build_index_table(strings: list[str]) -> str:
         "-" * 50,
     ]
     for i, s in enumerate(strings):
-        lines.append(f"{i:<6}  {s!r}")
+        # Show the string as it will be stored: stripped of characters XML
+        # cannot represent, so indices always match the generated table.
+        lines.append(f"{i:<6}  {_XML_ILLEGAL_C0.sub('', s)!r}")
     lines.append("")
     lines.append(
         f"Total: {len(strings)} unique strings. "
