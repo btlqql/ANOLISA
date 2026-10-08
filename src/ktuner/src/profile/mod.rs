@@ -64,7 +64,14 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("haproxy")
         || info.has_process("caddy");
     let has_java = info.has_process("java");
-    let has_search = info.has_process("elasticsearch") || info.has_process("opensearch");
+    let has_search = info.has_process("elasticsearch")
+        || info.has_process("opensearch")
+        // Solr is the same JVM search-engine class as Elasticsearch: the
+        // runtime marker table already resolves org.apache.solr to the
+        // "solr" service, but has_search never read it, so a Solr-only host
+        // classified mixed while an Elasticsearch host got the
+        // memory-intensive profile.
+        || info.has_process("solr");
     let has_streaming = info.has_process("kafka")
         || info.has_process("flink")
         || info.has_process("spark")
@@ -240,6 +247,22 @@ mod tests {
         assert_eq!(
             classify(&make_info(vec!["elasticsearch"])),
             WorkloadType::MemoryIntensive
+        );
+    }
+
+    /// Solr is the same JVM search-engine class as Elasticsearch (the runtime
+    /// marker table already resolves org.apache.solr cmdlines to "solr"), so
+    /// a Solr-only host is a memory-intensive workload, not mixed.
+    #[test]
+    fn test_classify_solr() {
+        assert_eq!(
+            classify(&make_info(vec!["solr"])),
+            WorkloadType::MemoryIntensive
+        );
+        // A database still outranks the search tier on a combined host.
+        assert_eq!(
+            classify(&make_info(vec!["solr", "postgres"])),
+            WorkloadType::IoLatency
         );
     }
 
