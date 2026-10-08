@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SWEInstance(BaseModel):
@@ -130,6 +130,24 @@ class DatasetConfig(BaseModel):
     filter_regex: str | None = Field(default=None, description="Regex filter for instance IDs")
     slice_range: str | None = Field(default=None, description="Slice string (e.g., '0:5')")
     instance_ids: list[str] | None = Field(default=None, description="Specific instance IDs to run")
+
+    @field_validator("filter_regex")
+    @classmethod
+    def validate_filter_regex(cls, value: str | None) -> str | None:
+        """Compile eagerly so a typo'd --filter fails at construction.
+
+        An invalid pattern used to pass validation and only crash later
+        in filter_instances with a raw re.error traceback.
+        """
+        if value is None:
+            return value
+        import re as _re
+
+        try:
+            _re.compile(value)
+        except _re.error as exc:
+            raise ValueError(f"filter_regex is not a valid regex: {exc}") from exc
+        return value
 
     def get_slice(self) -> tuple[int, int] | None:
         """Parse slice_range string to (start, end) tuple.
