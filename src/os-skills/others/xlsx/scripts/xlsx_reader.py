@@ -58,6 +58,13 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
 
     elif suffix in (".csv", ".tsv"):
         sep = "\t" if suffix == ".tsv" else ","
+        if sheet_name_filter and sheet_name_filter != path.stem:
+            # CSVs load as a single sheet keyed by the file stem; silently
+            # ignoring the filter analyzed data the caller never asked for.
+            raise ValueError(
+                f"Sheet '{sheet_name_filter}' not found. "
+                f"'{path.name}' contains a single sheet: '{path.stem}'"
+            )
         encodings = ["utf-8-sig", "gbk", "utf-8", "latin-1"]
         last_error = None
         for enc in encodings:
