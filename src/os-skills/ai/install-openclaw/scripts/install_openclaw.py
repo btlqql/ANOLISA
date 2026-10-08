@@ -535,6 +535,11 @@ def apply_config(config, config_path, *, dry_run=False):
                 existing = json.load(fh)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Invalid JSON in {config_path}: {exc}") from exc
+        if not isinstance(existing, dict):
+            raise SystemExit(
+                f"{config_path} does not contain a JSON object. "
+                "Move it aside and rerun the installer."
+            )
 
     merged = deep_merge(existing, config)
     merged = merge_plugin_allow(existing, merged)
