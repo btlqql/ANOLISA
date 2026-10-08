@@ -1,0 +1,39 @@
+name: PR 6556 raw input verification
+on:
+  push:
+    branches: ['codex/verify-6556-20261008']
+permissions:
+  contents: read
+jobs:
+  raw-input:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: src/cosh-ng
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: abab7abe04f64db61d5434d03c7bf3c5860482b5
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/cosh-ng
+      - name: Record tested commit and toolchain
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: cargo +1.88.0 fmt --all -- --check
+      - name: Raw input regression suite
+        run: |
+          set -o pipefail
+          cargo +1.88.0 test --locked -p cosh-shell --lib raw_input 2>&1 | tee raw-input.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr6556-raw-input-evidence
+          path: src/cosh-ng/raw-input.log
