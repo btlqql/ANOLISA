@@ -1322,24 +1322,43 @@ fn eval_tcp_tw_reuse(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
-        return 1;
-    }
-    let current = read_sysctl_u64(path);
-    if current == 0 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_tw_reuse".to_string(),
-            current_value: "0".to_string(),
-            recommended_value: "1".to_string(),
-            reason:
-                "允许复用 TIME_WAIT 状态的 socket 建立新的出站连接，减少高并发短连接场景的端口耗尽"
-                    .to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = tw_reuse_recommendation(read_sysctl_i64(path), info.has_listen_sockets()) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the TIME_WAIT reuse rule (the `*_recommendation`
+/// idiom) so the loopback-only value is assertable on any host.
+///
+/// `tcp_tw_reuse` is a three-state knob, not a boolean: 0 disables reuse, 1
+/// enables it for all destinations, and 2 — the default since v4.12
+/// (net/ipv4/sysctl_net_ipv4.c) — enables it *for loopback traffic only*.
+/// The `== 0` gate therefore skipped every host running the modern default:
+/// outbound TIME_WAIT sockets (the exact port-exhaustion scenario the reason
+/// describes) are not covered by a loopback-only setting, so value 2 needs
+/// the same recommendation as value 0. The knob is read signed for the same
+/// reason as `tcp_syncookies`: through v5.10 it was a plain `proc_dointvec`
+/// int with no min/max, where -1 is a legal truthy value.
+fn tw_reuse_recommendation(current: i64, has_listen_sockets: bool) -> Option<Recommendation> {
+    if !has_listen_sockets || current == 1 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_tw_reuse".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "1".to_string(),
+        reason: if current == 2 {
+            "tcp_tw_reuse=2 仅对回环地址生效（4.12 起的默认值），出站连接仍会积累 TIME_WAIT 并耗尽临时端口；改为 1 后在协议安全的前提下全局复用"
+                .to_string()
+        } else {
+            "允许复用 TIME_WAIT 状态的 socket 建立新的出站连接，减少高并发短连接场景的端口耗尽"
+                .to_string()
+        },
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_tcp_fin_timeout(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7888,6 +7907,33 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_tw_reuse") {
             assert_eq!(rec.recommended_value, "1");
         }
+    }
+
+    /// `tcp_tw_reuse=2` is the default since v4.12 and enables reuse for
+    /// *loopback traffic only*: the outbound port-exhaustion scenario this
+    /// rule addresses is still fully uncovered, yet the old `== 0` gate
+    /// skipped exactly that modern default.
+    #[test]
+    fn tw_reuse_recommends_on_the_loopback_only_default() {
+        let rec = tw_reuse_recommendation(2, true).expect("value 2 must be recommended");
+        assert_eq!(rec.current_value, "2");
+        assert_eq!(rec.recommended_value, "1");
+        assert!(rec.reason.contains("回环"), "{}", rec.reason);
+    }
+
+    /// Value 1 is already the global setting this rule asks for.
+    #[test]
+    fn tw_reuse_stays_quiet_when_globally_enabled() {
+        assert!(tw_reuse_recommendation(1, true).is_none());
+    }
+
+    /// Value 0 (disabled) keeps recommending, and the listener gate still
+    /// applies to every value.
+    #[test]
+    fn tw_reuse_keeps_disabled_and_listener_gates() {
+        assert!(tw_reuse_recommendation(0, true).is_some());
+        assert!(tw_reuse_recommendation(0, false).is_none());
+        assert!(tw_reuse_recommendation(2, false).is_none());
     }
 
     #[test]
