@@ -71,7 +71,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         // Pulsar is the same event-streaming class as Kafka; the runtime
         // detector already resolves org.apache.pulsar broker cmdlines to
         // the "pulsar" service.
-        || info.has_process("pulsar");
+        || info.has_process("pulsar")
+        // Hadoop is the batch/ETL engine the runtime marker table already
+        // resolves (org.apache.hadoop -> "hadoop"): sequential MapReduce IO
+        // is the io-throughput profile's own definition, so a Hadoop-only
+        // host must not fall through to mixed.
+        || info.has_process("hadoop");
 
     if has_db {
         return WorkloadType::IoLatency;
@@ -313,6 +318,22 @@ mod tests {
         // A database on the same host still outranks the streaming tier.
         assert_eq!(
             classify(&make_info(vec!["pulsar", "postgres"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves org.apache.hadoop to "hadoop";
+    /// a Hadoop node is batch/ETL IO, the io-throughput profile's own
+    /// definition, not mixed.
+    #[test]
+    fn test_classify_hadoop() {
+        assert_eq!(
+            classify(&make_info(vec!["hadoop"])),
+            WorkloadType::IoThroughput
+        );
+        // A database on the same host still outranks the batch tier.
+        assert_eq!(
+            classify(&make_info(vec!["hadoop", "postgres"])),
             WorkloadType::IoLatency
         );
     }
