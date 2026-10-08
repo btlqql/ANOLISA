@@ -45,6 +45,11 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("tidb-server")
         || info.has_process("tikv-server")
         || info.has_process("mongod")
+        // HBase is the distributed KV store the runtime marker table
+        // already resolves ("hbase" -> "hbase"): the io-latency profile is
+        // defined as "OLTP databases, KV stores", so an HBase-only host
+        // must not fall through to mixed.
+        || info.has_process("hbase")
         || info.has_process("clickhouse");
     let has_cache = info.has_process("redis-server")
         || info.has_process("memcached")
@@ -223,6 +228,21 @@ mod tests {
         // A database still outranks the web tier on a combined host.
         assert_eq!(
             classify(&make_info(vec!["tidb-server", "nginx"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves hbase to "hbase"; a distributed KV
+    /// store is the io-latency profile's own definition, not mixed.
+    #[test]
+    fn test_classify_hbase() {
+        assert_eq!(
+            classify(&make_info(vec!["hbase"])),
+            WorkloadType::IoLatency
+        );
+        // A database still outranks the web tier on a combined host.
+        assert_eq!(
+            classify(&make_info(vec!["hbase", "nginx"])),
             WorkloadType::IoLatency
         );
     }
