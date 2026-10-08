@@ -292,6 +292,21 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
                             )
                             results["error_count"] += 1
 
+        # A --sheet value that matched no worksheet audited nothing; without
+        # this guard the run reported PASS (exit 0) for a file never checked.
+        if sheet_filter and sheet_names and not results["sheets_checked"]:
+            results["errors"].append(
+                {
+                    "type": "unknown_sheet_filter",
+                    "sheet": sheet_filter,
+                    "message": (
+                        f"Sheet '{sheet_filter}' not found in workbook. "
+                        f"Valid sheets: {sorted(valid_sheet_names)}"
+                    ),
+                }
+            )
+            results["error_count"] += 1
+
     return results
 
 
@@ -396,6 +411,8 @@ def main() -> None:
                 print(f"         Defined names: {e.get('defined_names', [])}")
             elif e["type"] == "malformed_error_cell":
                 print(f"  [FAIL] [{e['sheet']}!{e['cell']}] malformed error cell: {e['detail']}")
+            elif e["type"] == "unknown_sheet_filter":
+                print(f"  [FAIL] {e['message']}")
             elif e["type"] == "file_error":
                 print(f"  [FAIL] File error: {e['message']}")
         print()
