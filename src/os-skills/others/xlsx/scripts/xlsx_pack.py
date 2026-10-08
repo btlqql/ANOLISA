@@ -18,6 +18,21 @@ import os
 import zipfile
 import xml.etree.ElementTree as ET
 
+# OS metadata files that appear in working directories uninvited (macOS
+# Finder, Windows Explorer). They are not package parts; zipping them into
+# the archive makes Excel flag the file for repair.
+_JUNK_BASENAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+_JUNK_DIRNAMES = {"__MACOSX"}
+
+
+def _is_junk(rel_path: str) -> bool:
+    """True for OS metadata files/dirs that must not enter the archive."""
+    parts = rel_path.split(os.sep)
+    if any(p in _JUNK_DIRNAMES for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    return name in _JUNK_BASENAMES or name.startswith("._")
+
 
 def validate_xml_files(source_dir: str) -> list[str]:
     """Return list of XML files that fail to parse."""
@@ -64,14 +79,20 @@ def pack(source_dir: str, xlsx_path: str) -> None:
 
     print("✓ All XML files are well-formed")
 
-    # Count files to pack
-    file_count = sum(len(files) for _, _, files in os.walk(source_dir))
+    # Count files to pack (excluding OS junk)
+    file_count = 0
+    for dirpath, _, filenames in os.walk(source_dir):
+        for fname in filenames:
+            if not _is_junk(os.path.relpath(os.path.join(dirpath, fname), source_dir)):
+                file_count += 1
 
     with zipfile.ZipFile(xlsx_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for dirpath, _, filenames in os.walk(source_dir):
             for fname in filenames:
                 fpath = os.path.join(dirpath, fname)
                 arcname = os.path.relpath(fpath, source_dir)
+                if _is_junk(arcname):
+                    continue
                 z.write(fpath, arcname)
 
     size = os.path.getsize(xlsx_path)
