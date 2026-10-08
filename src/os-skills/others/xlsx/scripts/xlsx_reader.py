@@ -176,7 +176,10 @@ def audit_quality(sheets: dict) -> dict:
             col_lower = str(col).lower()
             # "年" is the Chinese character for "year" — detect year columns in CJK spreadsheets
             if "year" in col_lower or "yr" in col_lower or "年" in col_lower:
-                if df[col].dropna().between(1900, 2200).all():
+                series = df[col].dropna()
+                # An all-null column is vacuously "between" the bounds;
+                # only non-empty evidence makes a year column.
+                if len(series) > 0 and series.between(1900, 2200).all():
                     if df[col].dtype == float:
                         sheet_findings.append({
                             "type": "year_as_float",
