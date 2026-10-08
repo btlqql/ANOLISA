@@ -94,6 +94,9 @@ def start_mock_services_with_offset(task_yaml: str, task_dir: str, port_offset: 
         env["NO_PROXY"] = "localhost,127.0.0.1"
         env["PORT"] = str(port)
         for k, v in svc.get("env", {}).items():
+            # YAML parses RETRY: 3 / DEBUG: true as int/bool; env vars and
+            # the tasks/ prefix check below both need strings.
+            v = str(v)
             if v.startswith("tasks/"):
                 v = os.path.join(project_root, v)
             env[k] = v
