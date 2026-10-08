@@ -390,6 +390,14 @@ def main() -> None:
                              row_map, args.border_row, args.border_style,
                              col)
 
+    # Re-sort sheetData rows: rows newly created above were appended at
+    # the end, after any higher row already stored (e.g. a gapped sheet
+    # holding rows 1, 2, 10). OOXML requires ascending <row> order.
+    sheet_data[:] = sorted(
+        sheet_data,
+        key=lambda el: int(el.get("r")) if el.get("r") else 0,
+    )
+
     _write_tree(ws_tree, ws_path)
     print(f"\nDone. {changes} cells added.")
     print(f"\nNext: python3 xlsx_pack.py {args.work_dir} output.xlsx")
