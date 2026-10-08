@@ -71,7 +71,9 @@ class MockServiceManager:
         self.port_offset = port_offset
 
         with open(self.task_yaml_path) as f:
-            self.task = yaml.safe_load(f)
+            # yaml.safe_load returns None for an empty / comment-only
+            # document; normalise to {} so task.get() below is safe.
+            self.task = yaml.safe_load(f) or {}
 
         self.services = self.task.get("services", [])
         self.processes: list[subprocess.Popen] = []
