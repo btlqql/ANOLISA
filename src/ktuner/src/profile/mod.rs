@@ -45,6 +45,11 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("tidb-server")
         || info.has_process("tikv-server")
         || info.has_process("mongod")
+        // Cassandra is the same NoSQL OLTP store class as mongod: the
+        // runtime marker table already resolves org.apache.cassandra
+        // cmdlines to the "cassandra" service, but no classify branch read
+        // it, so a Cassandra-only host fell through to mixed.
+        || info.has_process("cassandra")
         || info.has_process("clickhouse");
     let has_cache = info.has_process("redis-server")
         || info.has_process("memcached")
@@ -231,6 +236,22 @@ mod tests {
     fn test_classify_clickhouse() {
         assert_eq!(
             classify(&make_info(vec!["clickhouse"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves org.apache.cassandra cmdlines to the
+    /// "cassandra" service; classify must route that host to the same OLTP
+    /// profile as mongod instead of mixed.
+    #[test]
+    fn test_classify_cassandra() {
+        assert_eq!(
+            classify(&make_info(vec!["cassandra"])),
+            WorkloadType::IoLatency
+        );
+        // A database still outranks the web tier on a combined host.
+        assert_eq!(
+            classify(&make_info(vec!["cassandra", "nginx"])),
             WorkloadType::IoLatency
         );
     }
