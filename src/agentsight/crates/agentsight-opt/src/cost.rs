@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::atif::{AtifStep, AtifTrajectory, observation_result_is_error};
+use crate::atif::{observation_result_is_error, AtifStep, AtifTrajectory};
 use crate::types::{
     CostFinding, CostHeadroom, CostRatioMetrics, CostSegment, CostStats, LlmCall,
     RedundantCallGroup, TurnLedgerRow, WasteCandidate, WasteCandidateSet,
@@ -802,19 +802,40 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 /// Whether a tool call command looks like a backtrack / dead-end reversal.
+/// Branch creation (`git checkout -b`/`-B`; `-B` folds to `-b` in the
+/// lowercase) discards nothing — it is forward progress, so it stays out
+/// even though it contains "git checkout".
+///
+/// Reading the stash is the same kind of no-op: `git stash list` and
+/// `git stash show` only report what is stashed, so they stay out too, while
+/// the forms that change the working tree (`git stash`, `pop`, `drop`, …)
+/// remain backtracks.
+///
+/// `git switch` is git 2.23's spelling of `git checkout <branch>`; without
+/// this arm the same branch move goes uncounted when the agent spells it
+/// the modern way. Branch creation keeps the -b exemption by its modern
+/// spelling too.
 fn is_backtrack_cmd(cmd: &str) -> bool {
     let c = cmd.to_lowercase();
+    let checkout = c.contains("git checkout") && !c.contains("git checkout -b");
+    let switch = c.contains("git switch")
+        && !c.contains("git switch -c")
+        && !c.contains("git switch --create");
+    let stash =
+        c.contains("git stash") && !c.contains("git stash list") && !c.contains("git stash show");
     [
-        "git checkout",
         "git reset",
         "git revert",
-        "git stash",
         "git restore",
+        "git clean",
         "回退",
         "撤销",
     ]
     .iter()
     .any(|k| c.contains(k))
+        || checkout
+        || switch
+        || stash
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +843,11 @@ fn is_backtrack_cmd(cmd: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Tools whose target file identifies the artifact a turn produced.
+///
+/// The single write-tool set for the crate: the turn ledger's rework targets
+/// (`write_target`) and the accuracy coverage evidence
+/// (`requirement_check::aggregate_files_touched`) must agree, or edits made with
+/// a name one of them misses vanish from that consumer.
 const WRITE_TOOLS: &[&str] = &[
     "write",
     "edit",
@@ -830,6 +856,8 @@ const WRITE_TOOLS: &[&str] = &[
     "str_replace_editor",
     "create_file",
     "apply_patch",
+    "writefile",
+    "editfile",
 ];
 
 /// Above this turn count the ledger switches to short heads to stay in context.
@@ -974,7 +1002,7 @@ pub(crate) fn build_turn_ledger(
                 let backtrack = step
                     .calls()
                     .iter()
-                    .any(|c| is_backtrack_cmd(&c.command_summary(CMD_SIG_CHARS)));
+                    .any(|c| c.command().is_some_and(is_backtrack_cmd));
                 let action_sig = step
                     .calls()
                     .first()
@@ -1129,7 +1157,7 @@ pub(crate) fn extract_waste_candidates_from(
     // inputs. The agent-step ordinal is the replay step index. (Backtrack
     // signals live in the turn ledger, keyed by the same ordinal.)
     let mut tool_outputs: Vec<(usize, String, usize, String)> = Vec::new(); // step, name, tokens, snippet
-    // (first replay turn, replays, tokens, snippet)
+                                                                            // (first replay turn, replays, tokens, snippet)
     let mut user_inputs: Vec<(usize, usize, usize, String)> = Vec::new();
 
     let mut turn_idx: i64 = -1;
@@ -1138,7 +1166,7 @@ pub(crate) fn extract_waste_candidates_from(
             "agent" => {
                 turn_idx += 1;
                 let step_no = turn_idx.max(0) as usize;
-                for result in step.results() {
+                for (k, result) in step.results().iter().enumerate() {
                     let text = result.content.as_deref().unwrap_or("");
                     let toks = estimate_tokens(text);
                     if toks >= TOOL_TRIM_MIN {
@@ -1148,10 +1176,23 @@ pub(crate) fn extract_waste_candidates_from(
                             .and_then(|id| {
                                 step.calls()
                                     .iter()
-                                    .find(|c| c.tool_call_id == id)
+                                    .find(|c| agentsight_atif::same_call_id(&c.tool_call_id, id))
                                     .map(|c| c.function_name.clone())
                             })
-                            .or_else(|| step.calls().first().map(|c| c.function_name.clone()))
+                            .or_else(|| {
+                                // Positional pairing is only for documents whose
+                                // results carry no ids at all (the same rule
+                                // `collect_tool_calls_with` applies). Falling
+                                // back whenever the id misses would blame the
+                                // first tool of the step for a sibling's output
+                                // and feed that name into the candidate's facts.
+                                step.results()
+                                    .iter()
+                                    .all(|r| r.source_call_id.is_none())
+                                    .then(|| step.calls().get(k))
+                                    .flatten()
+                                    .map(|c| c.function_name.clone())
+                            })
                             .unwrap_or_else(|| "unknown".to_string());
                         tool_outputs.push((step_no, name, toks, trunc(text, SNIPPET_CHARS)));
                     }
@@ -1575,6 +1616,71 @@ mod tests {
         assert_eq!(tool.optimization, "工具输出截断");
         assert!(tool.facts.contains("Read"));
         assert!(set.total_input_tokens > 0);
+    }
+
+    /// A big observation whose id matches no call (its result never arrived, or
+    /// the producer dropped the id) must not borrow the first tool's name: the
+    /// name lands in the candidate's facts and in the LLM's evidence.
+    #[test]
+    fn unmatched_observation_id_does_not_borrow_the_first_tools_name() {
+        let big = "x ".repeat(6000);
+        let t = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"go"}},
+            {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+             "tool_calls":[
+                {{"tool_call_id":"c1","function_name":"Read","arguments":{{"file_path":"/a"}}}},
+                {{"tool_call_id":"c2","function_name":"Bash","arguments":{{"command":"ls"}}}}],
+             "observation":{{"results":[{{"source_call_id":"c9","content":"{big}"}}]}}}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:03.000Z","message":"ok"}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&t).unwrap();
+        let tool = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "tool_output")
+            .expect("tool_output candidate");
+        assert!(
+            !tool.facts.contains("Read"),
+            "a result whose id matches no call must not inherit the first tool's name: {}",
+            tool.facts
+        );
+        assert!(tool.facts.contains("unknown"), "facts: {}", tool.facts);
+    }
+
+    /// Two id-less results pair positionally with the calls, not all with the
+    /// first one.
+    #[test]
+    fn id_less_observations_pair_positionally_not_all_to_the_first_call() {
+        let big = "x ".repeat(6000);
+        let t = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"go"}},
+            {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+             "tool_calls":[
+                {{"tool_call_id":"c1","function_name":"Read","arguments":{{"file_path":"/a"}}}},
+                {{"tool_call_id":"c2","function_name":"Bash","arguments":{{"command":"ls"}}}}],
+             "observation":{{"results":[{{"content":"{big}"}},{{"content":"{big}"}}]}}}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:03.000Z","message":"ok"}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&t).unwrap();
+        let tool = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "tool_output")
+            .expect("tool_output candidate");
+        assert!(
+            tool.facts.contains("Read"),
+            "first result pairs with the first call: {}",
+            tool.facts
+        );
+        assert!(
+            tool.facts.contains("Bash"),
+            "second result pairs with the second call: {}",
+            tool.facts
+        );
     }
 
     #[test]
@@ -2090,5 +2196,224 @@ mod tests {
         // 2k tok x 0.6 x (6 + 3) = 10800; counting the finished turn too
         // would report 12000.
         assert_eq!(up.potential_save_tokens, 10_800);
+    }
+
+    /// `git checkout -b/-B` creates a branch: nothing is discarded, so it is
+    /// forward progress, not a reversal. Flagging it BACKTRACK feeds a false
+    /// 回退 count into the detour prompt and pads the prevention ceiling
+    /// with that turn's tokens.
+    #[test]
+    fn branch_creation_is_not_a_backtrack() {
+        assert!(!is_backtrack_cmd("git checkout -b feature/opt"));
+        assert!(!is_backtrack_cmd("git checkout -B feature/opt"));
+        assert!(!is_backtrack_cmd("cd /repo && git checkout -b fix/parse"));
+        // Discarding and reset forms stay backtracks.
+        assert!(is_backtrack_cmd("git checkout -- src/lib.rs"));
+        assert!(is_backtrack_cmd("git checkout ."));
+        assert!(is_backtrack_cmd("git reset --hard HEAD~1"));
+        // `git clean` discards untracked files — a working-tree rewind.
+        assert!(is_backtrack_cmd("git clean -fd"));
+        assert!(is_backtrack_cmd("git clean -n"));
+
+        // End to end: the ledger and the detour facts must not count a
+        // branch creation as a backtrack.
+        let mut steps = String::from(
+            r#"{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"start"}"#,
+        );
+        steps.push_str(
+            r#",{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+                "tool_calls":[{"tool_call_id":"c1","function_name":"Bash","arguments":{"command":"git checkout -b feature/opt"}}],
+                "observation":{"results":[{"source_call_id":"c1","content":"Switched to a new branch"}]}}"#,
+        );
+        for id in 3..=6 {
+            steps.push_str(&format!(
+                r#",{{"step_id":{id},"source":"agent","timestamp":"2026-07-02T06:30:0{id}.000Z","message":"working"}}"#
+            ));
+        }
+        let t = traj(&format!("[{steps}]"));
+        let set = extract_waste_candidates(&t).unwrap();
+        let detour = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "detour")
+            .expect("detour fires on a 5-turn trajectory");
+        assert!(
+            detour.facts.contains("0 处回退"),
+            "branch creation must not count as a backtrack: {}",
+            detour.facts
+        );
+        assert!(
+            set.ledger.iter().all(|r| !r.backtrack),
+            "no ledger row may carry the BACKTRACK flag: {:?}",
+            set.ledger
+        );
+    }
+
+    /// Inspecting the stash (`git stash list` / `git stash show`) discards
+    /// nothing, exactly like creating a branch: the command reads what is
+    /// stashed instead of rewinding the working tree. The bare-substring match
+    /// still flagged it, so a turn that only looked at the stash counted as a
+    /// reversal in the ledger, the detour facts and the prevention ceiling.
+    #[test]
+    fn stash_inspection_is_not_a_backtrack() {
+        assert!(!is_backtrack_cmd("git stash list"));
+        assert!(!is_backtrack_cmd("git stash show -p stash@{0}"));
+        assert!(!is_backtrack_cmd("cd /repo && git stash list"));
+        assert!(!is_backtrack_cmd("git stash show --stat"));
+
+        // Stash forms that do change the working tree stay backtracks.
+        assert!(is_backtrack_cmd("git stash"));
+        assert!(is_backtrack_cmd("git stash pop"));
+        assert!(is_backtrack_cmd("git stash drop"));
+        assert!(is_backtrack_cmd("git stash push -m wip"));
+
+        // End to end: the ledger and the detour facts must not count a stash
+        // listing as a backtrack.
+        let mut steps = String::from(
+            r#"{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"start"}"#,
+        );
+        steps.push_str(
+            r#",{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+                "tool_calls":[{"tool_call_id":"c1","function_name":"Bash","arguments":{"command":"git stash list"}}],
+                "observation":{"results":[{"source_call_id":"c1","content":"stash@{0}: WIP on main"}]}}"#,
+        );
+        for id in 3..=6 {
+            steps.push_str(&format!(
+                r#",{{"step_id":{id},"source":"agent","timestamp":"2026-07-02T06:30:0{id}.000Z","message":"working"}}"#
+            ));
+        }
+        let t = traj(&format!("[{steps}]"));
+        let set = extract_waste_candidates(&t).unwrap();
+        let detour = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "detour")
+            .expect("detour fires on a 5-turn trajectory");
+        assert!(
+            detour.facts.contains("0 处回退"),
+            "a stash listing must not count as a backtrack: {}",
+            detour.facts
+        );
+        assert!(
+            set.ledger.iter().all(|r| !r.backtrack),
+            "no ledger row may carry the BACKTRACK flag: {:?}",
+            set.ledger
+        );
+    }
+
+    /// The keyword table is matched against the *command* a call ran, not
+    /// against its argument blob. `command_summary` serializes the whole
+    /// `arguments` object, so arguments that merely *mention* a reversal — a
+    /// `Grep` for the pattern `git stash pop`, an `Edit` whose replacement text
+    /// quotes 回退 — used to flag the turn BACKTRACK and inflate the detour
+    /// facts' 回退 count, while a real reversal truncated past the summary
+    /// window was missed.
+    #[test]
+    fn arguments_mentioning_a_reversal_are_not_a_backtrack() {
+        let build = |name: &str, arguments: &str| {
+            let mut steps = String::from(
+                r#"{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"start"}"#,
+            );
+            steps.push_str(&format!(
+                r#",{{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+                    "tool_calls":[{{"tool_call_id":"c1","function_name":"{name}","arguments":{arguments}}}],
+                    "observation":{{"results":[{{"source_call_id":"c1","content":"done"}}]}}}}"#
+            ));
+            for id in 3..=6 {
+                steps.push_str(&format!(
+                    r#",{{"step_id":{id},"source":"agent","timestamp":"2026-07-02T06:30:0{id}.000Z","message":"working"}}"#
+                ));
+            }
+            extract_waste_candidates(&traj(&format!("[{steps}]"))).unwrap()
+        };
+        let backtracks = |set: &crate::cost::WasteCandidateSet| {
+            (
+                set.ledger.iter().filter(|row| row.backtrack).count(),
+                set.candidates
+                    .iter()
+                    .find(|candidate| candidate.id == "detour")
+                    .map(|candidate| candidate.facts.contains("1 处回退"))
+                    .unwrap_or(false),
+            )
+        };
+
+        // Calls whose *arguments* name a reversal but which ran no command at
+        // all: a search pattern, an edit body, a document path.
+        for (name, arguments) in [
+            ("Grep", r#"{"pattern":"git stash pop","path":"src"}"#),
+            ("Grep", r#"{"pattern":"git reset --hard","glob":"*.md"}"#),
+            (
+                "Edit",
+                r#"{"file_path":"src/a.rs","new_string":"// 回退到旧实现"}"#,
+            ),
+            (
+                "Write",
+                r#"{"file_path":"docs/plan.md","content":"撤销上一次改动"}"#,
+            ),
+            ("Read", r#"{"file_path":"docs/git-revert.md"}"#),
+        ] {
+            let (rows, facts_say_one) = backtracks(&build(name, arguments));
+            assert_eq!(rows, 0, "{name} {arguments} must not flag a ledger row");
+            assert!(!facts_say_one, "{name} {arguments} must not count a 回退");
+        }
+
+        // A real reversal still is one.
+        let (rows, facts_say_one) =
+            backtracks(&build("Bash", r#"{"command":"git reset --hard HEAD~1"}"#));
+        assert_eq!(rows, 1, "a real reversal must still flag its ledger row");
+        assert!(facts_say_one, "a real reversal must still be counted");
+    }
+
+    /// `git switch` is git 2.23's spelling of `git checkout <branch>`, so the
+    /// same branch move must count the same way. Before this the modern
+    /// spelling was invisible to the heuristic: an agent abandoning a line of
+    /// work via `git switch` fed a false 0 回退 count into the detour prompt
+    /// and kept its tokens out of the prevention ceiling, while the legacy
+    /// `git checkout <branch>` counted.
+    #[test]
+    fn branch_moves_by_the_modern_spelling_are_backtracks() {
+        assert!(is_backtrack_cmd("git switch main"));
+        assert!(is_backtrack_cmd("cd /repo && git switch feature/opt"));
+        // Branch creation by its modern spelling discards nothing, exactly
+        // like `git checkout -b`.
+        assert!(!is_backtrack_cmd("git switch -c fix/parse"));
+        assert!(!is_backtrack_cmd("git switch -C fix/parse"));
+        assert!(!is_backtrack_cmd("git switch --create fix/parse"));
+        // The legacy spellings keep their #5532 behavior.
+        assert!(is_backtrack_cmd("git checkout main"));
+        assert!(!is_backtrack_cmd("git checkout -b feature/opt"));
+
+        // End to end: a branch move by its modern spelling must mark the
+        // ledger row BACKTRACK and count in the detour facts.
+        let mut steps = String::from(
+            r#"{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"start"}"#,
+        );
+        steps.push_str(
+            r#",{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+                "tool_calls":[{"tool_call_id":"c1","function_name":"Bash","arguments":{"command":"git switch main"}}],
+                "observation":{"results":[{"source_call_id":"c1","content":"Switched to branch 'main'"}]}}"#,
+        );
+        for id in 3..=6 {
+            steps.push_str(&format!(
+                r#",{{"step_id":{id},"source":"agent","timestamp":"2026-07-02T06:30:0{id}.000Z","message":"working"}}"#
+            ));
+        }
+        let t = traj(&format!("[{steps}]"));
+        let set = extract_waste_candidates(&t).unwrap();
+        let detour = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "detour")
+            .expect("detour fires on a 5-turn trajectory");
+        assert!(
+            detour.facts.contains("1 处回退"),
+            "a branch move by its modern spelling must count as a backtrack: {}",
+            detour.facts
+        );
+        assert!(
+            set.ledger.iter().any(|r| r.backtrack),
+            "the branch-move row must carry the BACKTRACK flag: {:?}",
+            set.ledger
+        );
     }
 }

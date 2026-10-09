@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -37,6 +38,16 @@ REQUIRED_REGRESSION_TOOLS = {
 }
 
 
+def usable_regression_check(check: Any) -> bool:
+    """Require the same command/exit-code contract in every regression report."""
+    return (
+        isinstance(check, dict)
+        and isinstance(check.get("command"), str)
+        and isinstance(check.get("exit_code"), int)
+        and not isinstance(check.get("exit_code"), bool)
+    )
+
+
 def nested(value: dict[str, Any], *keys: str) -> float | bool | None:
     """Read a numeric or boolean value from nested dictionaries."""
     current: Any = value
@@ -54,19 +65,34 @@ def meets(actual: float | bool, expected: float | bool) -> bool:
     return not isinstance(actual, bool) and actual >= expected
 
 
-def timestamp(value: Any) -> float | None:
-    """Parse Unix or RFC 3339 timestamps emitted by the metric collectors."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if not isinstance(value, str) or not value:
+def finite_float(value: Any) -> float | None:
+    """Convert a sample value to a finite float, skipping unusable data."""
+    if isinstance(value, bool):
         return None
     try:
-        return float(value)
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def timestamp(value: Any) -> float | None:
+    """Parse a finite Unix or RFC 3339 timestamp from the metric collectors."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return finite_float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    result = finite_float(value)
+    if result is not None:
+        return result
+    try:
+        return finite_float(
+            datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        )
     except ValueError:
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
+        return None
 
 
 def continuous_recovery(
@@ -103,15 +129,15 @@ def resource_samples(run_path: Path, field: str) -> list[tuple[float, float]]:
     """Read one process or internal metric from the recovery CSV."""
     path = run_path.parent / "measurement" / "metrics.csv"
     if not path.exists():
+        path = path.with_suffix(path.suffix + ".gz")
+    if not path.exists():
         return []
     samples = []
-    with path.open(encoding="utf-8", newline="") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, mode="rt", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
             sample_time = timestamp(row.get("timestamp"))
-            try:
-                value = float(row[field]) if row.get(field) else None
-            except (KeyError, ValueError):
-                value = None
+            value = finite_float(row.get(field))
             if sample_time is not None and value is not None:
                 samples.append((sample_time, value))
     return samples
@@ -133,13 +159,14 @@ def load_samples(run_path: Path) -> dict[str, list[tuple[float, float]]]:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            data = item.get("data", {}) if isinstance(item, dict) else {}
-            sample_time = timestamp(data.get("time"))
-            try:
-                value = float(data.get("value"))
-            except (TypeError, ValueError):
+            if not isinstance(item, dict):
                 continue
-            if sample_time is None:
+            data = item.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            sample_time = timestamp(data.get("time"))
+            value = finite_float(data.get("value"))
+            if sample_time is None or value is None:
                 continue
             second = int(sample_time)
             if item.get("metric") == "benchmark_requests":
@@ -156,6 +183,20 @@ def load_samples(run_path: Path) -> dict[str, list[tuple[float, float]]]:
     }
 
 
+def summary_of_phase(
+    phases: dict[str, tuple[Path, dict[str, Any]]], label: str
+) -> dict[str, Any]:
+    """Read one phase's summary object from its run artifact.
+
+    A run artifact whose summary is absent or not an object carries no
+    evidence: the recovery gates must report it as missing instead of
+    raising KeyError/AttributeError on the collector's own output.
+    """
+    run = phases[label][1]
+    summary = run.get("summary") if isinstance(run, dict) else None
+    return summary if isinstance(summary, dict) else {}
+
+
 def recovery_outcome(
     phases: dict[str, tuple[Path, dict[str, Any]]],
     settings: dict[str, Any],
@@ -170,9 +211,9 @@ def recovery_outcome(
             "failed": [],
             "seconds": {},
         }
-    stable = phases["stable"][1]["summary"]
-    recover_path, recover_run = phases["recover"]
-    recover = recover_run["summary"]
+    stable = summary_of_phase(phases, "stable")
+    recover_path = phases["recover"][0]
+    recover = summary_of_phase(phases, "recover")
     tolerance = settings["tolerance_ratio"]
     window = settings["recovery_window_seconds"]
     load = load_samples(recover_path)
@@ -215,7 +256,12 @@ def recovery_outcome(
     seconds = {
         name: continuous_recovery(
             samples,
-            float(reference) if isinstance(reference, (int, float)) else None,
+            # A reference that is not a finite number is unusable evidence,
+            # not a threshold: a boolean is an int subclass (True would gate
+            # at 1.0) and a non-finite latency reference with
+            # lower-is-better passes every sample, so both must read as
+            # missing instead of silently gating the recovery.
+            finite_float(reference),
             tolerance,
             window,
             higher_is_better=higher_is_better,
@@ -277,12 +323,33 @@ def fault_outcome(
             "failed": [],
         }
     value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        return {
+            "verdict": "INCONCLUSIVE",
+            "missing": ["fault-results.json"],
+            "failed": [],
+        }
     outcomes = value.get("outcomes", {})
-    missing = [f"case:{name}" for name in sorted(FAULT_CASES - set(outcomes))]
+    if not isinstance(outcomes, dict):
+        outcomes = {}
+    usable: dict[str, int] = {}
+    malformed: set[str] = set()
+    for name in FAULT_CASES:
+        entry = outcomes.get(name)
+        if isinstance(entry, dict) and all(
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+            for count in entry.values()
+        ):
+            usable[name] = sum(entry.values())
+        else:
+            malformed.add(name)
+    missing = [f"case:{name}" for name in sorted(malformed)]
     failed = [
         f"count:{name}"
-        for name in sorted(FAULT_CASES & set(outcomes))
-        if sum(outcomes[name].values()) != settings["repetitions_per_case"]
+        for name in sorted(usable)
+        if usable[name] != settings["repetitions_per_case"]
     ]
     for name in ("server_healthy_after", "process_alive_before", "process_alive_after"):
         if value.get(name) is not True:
@@ -313,6 +380,21 @@ def fault_outcome(
     return {"verdict": verdict, "missing": missing, "failed": failed}
 
 
+def confirmation_verdicts(evidence: object, level: int) -> list[str]:
+    """Verdict strings a capacity result recorded for one QPS level.
+
+    The confirmation map comes from the capacity probe's own result file:
+    a non-object map, a non-list entry, or non-string verdicts are
+    incomplete evidence and read as no verdicts. Reading them as `str`
+    would silently pass `"PASSPASSPASS"` as three passes through
+    ``str.count``'s substring semantics.
+    """
+    entries = evidence.get(str(level)) if isinstance(evidence, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, str)]
+
+
 def audit_campaign(
     campaign_data: dict[str, Any],
     items: list[tuple[Path, dict[str, Any]]],
@@ -325,6 +407,9 @@ def audit_campaign(
     issues = []
     resolution = campaign_data["capacity"]["qps_resolution"]
     confirmations = campaign_data["capacity"]["confirm_repetitions"]
+    # A confirmation needs a majority of its repetitions; mirror campaign.py's
+    # rule so confirm_repetitions=1 does not demand two verdicts.
+    required_confirmations = confirmations // 2 + 1
     for version in VERSIONS:
         value = capacities.get(version, {})
         maximum = value.get("maximum_sustainable_qps")
@@ -335,15 +420,19 @@ def audit_campaign(
         if not isinstance(maximum, int) or failure != maximum + resolution:
             issues.append(f"{version} capacity lacks an adjacent failed QPS")
             continue
+        # The confirmation map comes from the capacity probe's own result
+        # file, so an unusable shape is incomplete evidence — the audit's
+        # contract is to enumerate every blocking reason, never to raise.
+        # A non-list entry must also not fall through to str.count, whose
+        # substring semantics would count "PASSPASSPASS" as three passes.
         evidence = value.get("confirmation", {})
-        if evidence.get(str(maximum), []).count("PASS") < 2:
+        passes = confirmation_verdicts(evidence, maximum)
+        fails = confirmation_verdicts(evidence, failure)
+        if passes.count("PASS") < required_confirmations:
             issues.append(f"{version} capacity pass confirmation is incomplete")
-        if evidence.get(str(failure), []).count("FAIL") < 2:
+        if fails.count("FAIL") < required_confirmations:
             issues.append(f"{version} capacity fail confirmation is incomplete")
-        if (
-            len(evidence.get(str(maximum), [])) < confirmations
-            or len(evidence.get(str(failure), [])) < confirmations
-        ):
+        if len(passes) < confirmations or len(fails) < confirmations:
             issues.append(f"{version} capacity repetitions are incomplete")
 
     maxima = [
@@ -395,7 +484,8 @@ def audit_campaign(
                         f"{version} matrix {qps} QPS rep {repetition} is missing"
                     )
                 elif (
-                    runs[0].get("duration_seconds") != matrix["duration_seconds"]
+                    runs[0].get("qps") != qps
+                    or runs[0].get("duration_seconds") != matrix["duration_seconds"]
                     or runs[0].get("warmup_seconds") != matrix["warmup_seconds"]
                     or runs[0].get("evaluation", {}).get("verdict") != "PASS"
                 ):
@@ -465,8 +555,14 @@ def audit_campaign(
             issues.append(f"{version} fault run did not pass")
 
     checks = regression.get("checks", [])
-    commands = "\n".join(str(check.get("command", "")) for check in checks)
-    if not checks or any(check.get("exit_code") != 0 for check in checks):
+    checks = checks if isinstance(checks, list) else []
+    usable_checks = [check for check in checks if usable_regression_check(check)]
+    commands = "\n".join(check["command"] for check in usable_checks)
+    if (
+        not checks
+        or len(usable_checks) != len(checks)
+        or any(check["exit_code"] != 0 for check in usable_checks)
+    ):
         issues.append("regression checks are missing or failed")
     if not regression.get("full"):
         issues.append("full Rust regression gates were not recorded")

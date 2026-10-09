@@ -125,15 +125,30 @@ const TraceSubTable: React.FC<TraceSubTableProps> = ({ sessionId, conversationIn
   const [evaluationLookupFailed, setEvaluationLookupFailed] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     setPage(0);
+    // A previous failure must not survive a successful reload: the render
+    // branch keys on `error`, so a transient failure would pin the error
+    // panel even after the next fetch returns rows. Guarding the responses
+    // also keeps a slow older request from overwriting a newer one.
+    setError(null);
     setEvaluations(new Map());
     setEvaluationLookupDone(new Set());
     setEvaluationLookupFailed(new Set());
     fetchTraces(sessionId, startNs, endNs)
-      .then(setTraces)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
+      .then((rows) => {
+        if (!cancelled) setTraces(rows);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId, startNs, endNs]);
 
   const totalPages = Math.max(1, Math.ceil(traces.length / PAGE_SIZE));
@@ -642,7 +657,8 @@ const ModelTimeseriesChart: React.FC<ModelTimeseriesChartProps> = ({
             dataKey={m}
             name={m}
             stackId="model"
-            fill={hidden.has(m) ? 'transparent' : MODEL_COLORS[i % MODEL_COLORS.length]}
+            hide={hidden.has(m)}
+            fill={MODEL_COLORS[i % MODEL_COLORS.length]}
           />
         ))}
       </BarChart>
@@ -842,7 +858,9 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
     try {
       const [sessData, tsData, intData, iStats, iSessionCounts, iConvCounts, savingsResp] = await Promise.all([
       fetchSessions(startNs, endNs).then((data) =>
-        agent ? data.filter((s) => s.agent_name === agent) : data
+        agent
+          ? data.filter((s) => (s.agent_name ?? '').toLowerCase() === agent.toLowerCase())
+          : data
       ),
       fetchTimeseries(startNs, endNs, agent),
       fetchInterruptionCount(startNs, endNs, agent).catch(() => null),
@@ -876,8 +894,9 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
   }, []);
 
   const handleQuery = useCallback(async () => {
-    const effectiveEnd = Date.now();
-    setEndMs(effectiveEnd);
+    // Query the end time the user picked. `endMs` is initialized to "now" when
+    // no end was chosen, so it is only ever re-defaulted at mount, never here.
+    const effectiveEnd = endMs;
     setError(null);
     setHasQueried(true);
     setSessionPage(0); // reset to first page on new query
@@ -892,7 +911,7 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
     if (!ok && requestId === loadRequestIdRef.current) {
       setError((error as Error)?.message ?? t('cl.queryFailed'));
     }
-  }, [startMs, selectedAgent, syncParams, runQuery, t]);
+  }, [startMs, endMs, selectedAgent, syncParams, runQuery, t]);
 
   // Auto-load on mount: show all records for the default time range immediately
   const hasRestoredRef = React.useRef(false);

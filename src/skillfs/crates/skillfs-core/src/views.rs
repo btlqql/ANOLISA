@@ -164,7 +164,7 @@ impl ViewsConfig {
 
     /// Return existing default-view skills plus skills not assigned to any view.
     ///
-    /// Resolve automatic membership in memory so read-only mounts need not
+    /// Resolve automatic membership in memory so mounts need not
     /// rewrite the source configuration. Explicit secondary assignments remain
     /// excluded, including when the file has no default view.
     pub fn effective_default_skills(&self, store: &crate::store::SkillStore) -> Vec<String> {
@@ -190,18 +190,24 @@ impl ViewsConfig {
 
     /// Append `new_skills` to the default view's skills list and save.
     ///
-    /// Used for auto-assigning newly installed skills that are not yet in
-    /// any view.
+    /// Persist an explicit addition; mounts resolve automatic membership in
+    /// memory without updating the source configuration.
     pub fn assign_to_default(
         &mut self,
         source_dir: &Path,
         new_skills: &[String],
     ) -> std::io::Result<()> {
-        if let Some(view) = self.views.iter_mut().find(|v| v.default) {
-            for skill in new_skills {
-                if !view.skills.contains(skill) {
-                    view.skills.push(skill.clone());
-                }
+        let Some(view) = self.views.iter_mut().find(|v| v.default) else {
+            // Nothing to assign to. Saving an unchanged config and reporting
+            // Ok made the caller log an auto-assignment that never happened.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no default view configured; new skills were not assigned",
+            ));
+        };
+        for skill in new_skills {
+            if !view.skills.contains(skill) {
+                view.skills.push(skill.clone());
             }
         }
         self.save(source_dir)
@@ -229,6 +235,36 @@ impl ViewsConfig {
             // file this call created.
             let _ = std::fs::remove_file(&tmp_path);
         }
+        result
+    }
+
+    /// Publish a config without replacing an existing one.
+    ///
+    /// Same staging sequence as [`Self::save`], but the publication step is
+    /// no-replace: the target only ever appears as a fully written file, and
+    /// if it appeared since the caller's absence check — another process, or
+    /// an editor save — the call fails with `AlreadyExists` instead of
+    /// renaming over it. Use this where "create only when absent" is the
+    /// contract; [`Self::save`] remains the replace-in-place path for
+    /// updating an existing config.
+    pub fn save_new(&self, source_dir: &Path) -> std::io::Result<()> {
+        let path = source_dir.join("skillfs-views.toml");
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let (tmp_path, mut file) = create_staging_file(source_dir)?;
+        let result = (|| {
+            use std::io::Write;
+            file.write_all(content.as_bytes())?;
+            // `hard_link` is the no-replace publication primitive: it fails
+            // with `AlreadyExists` when the name is taken (a symlink counts)
+            // and never follows or overwrites the target. The staging file is
+            // on the same directory, so the link cannot cross filesystems.
+            std::fs::hard_link(&tmp_path, &path)
+        })();
+        drop(file);
+        // Only this call stages at this path; dropping our own staging name is
+        // correct on success (the target is its second link) and on failure.
+        let _ = std::fs::remove_file(&tmp_path);
         result
     }
 }
@@ -367,6 +403,95 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_save_new_publishes_exactly_once() {
+        // Create-only publication is the atomic gate: every thread passes the
+        // same absence state before publishing, and the no-replace link lets
+        // exactly one win while the others report `AlreadyExists`.
+        let dir = TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let directory = dir.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut config = make_config();
+                    config.views[0].skills = vec![format!("skill-{worker}")];
+                    barrier.wait();
+                    config.save_new(&directory)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one create-only save may publish: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().filter(|r| r.is_err()).all(|r| r
+                .as_ref()
+                .err()
+                .map(std::io::Error::kind)
+                == Some(std::io::ErrorKind::AlreadyExists)),
+            "losers must report AlreadyExists: {outcomes:?}"
+        );
+        assert!(
+            ViewsConfig::load(dir.path()).is_some(),
+            "one complete config"
+        );
+        assert!(
+            staging_names(dir.path()).is_empty(),
+            "no staging file may be left behind: {:?}",
+            staging_names(dir.path())
+        );
+    }
+
+    #[test]
+    fn save_new_refuses_to_replace_an_existing_config() {
+        // A target that exists — whether hand-written or created after the
+        // caller's absence check — must survive byte for byte.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("skillfs-views.toml");
+        std::fs::write(&path, "user-authored config\n").unwrap();
+
+        let error = make_config()
+            .save_new(dir.path())
+            .expect_err("an existing config must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "user-authored config\n"
+        );
+        assert!(
+            staging_names(dir.path()).is_empty(),
+            "the loser must clean up its staging file: {:?}",
+            staging_names(dir.path())
+        );
+
+        // Publishing into a config-less directory succeeds and is loadable.
+        let fresh = TempDir::new().unwrap();
+        make_config().save_new(fresh.path()).expect("publish");
+        assert!(ViewsConfig::load(fresh.path()).is_some());
+        assert!(
+            staging_names(fresh.path()).is_empty(),
+            "the winner must drop its staging name: {:?}",
+            staging_names(fresh.path())
+        );
+    }
+
+    fn staging_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.contains(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
     fn save_leaves_a_foreign_staging_entry_alone() {
         // Only the call that created a staging file may remove it: an entry
         // left by a crashed save (or a concurrent writer) must survive.
@@ -411,6 +536,26 @@ mod tests {
 
         let loaded = ViewsConfig::load(dir.path()).unwrap();
         assert!(loaded.default_skills().contains(&"new-skill".to_string()));
+    }
+
+    #[test]
+    fn test_assign_to_default_without_a_default_view_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = make_config();
+        for view in &mut cfg.views {
+            view.default = false;
+        }
+        cfg.save(dir.path()).unwrap();
+        let path = dir.path().join("skillfs-views.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = cfg
+            .assign_to_default(dir.path(), &["new-skill".to_string()])
+            .expect_err("a config without a default view cannot assign");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!cfg.all_assigned_skills().contains("new-skill"));
+        // The config file is left untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

@@ -10,6 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 9):
+    raise SystemExit("AW CI control jobs require Python 3.9 or newer")
+
 AW = Path(__file__).resolve().parents[1]
 REPO = AW.parents[1]
 
@@ -141,6 +144,9 @@ def check_inventory() -> None:
         ("aw-provider", "protocol"),
         ("aw-provider", "admission"),
         ("aw-exec", "execution"),
+        ("aw-host", "host"),
+        ("aw-provider-sec-core", "provider"),
+        ("aw-service", "service"),
     ):
         command = ["cargo", "test", "--locked", "-p", package, "--test", target, "--", "--list"]
         tests = inventory(run(command, AW, capture=True))
@@ -153,11 +159,14 @@ def check_inventory() -> None:
 def structure(metadata: dict, root: Path) -> None:
     """Keep the reviewed crate boundaries and Rust source sizes explicit."""
     allowed = {
+        "aw-provider-sec-core": {"aw-exec", "aw-provider", "serde", "serde_json", "thiserror", "libc"},
         "aw-contracts": {"jsonschema", "serde", "serde_json", "sha2", "thiserror"},
         "aw-core": {"aw-contracts", "serde_json", "thiserror"},
         "aw-config": {"jsonschema", "serde", "serde_json", "serde_yaml_ng", "thiserror"},
         "aw-provider": {"aw-config", "jsonschema", "serde", "serde_json", "sha2", "thiserror"},
         "aw-exec": {"libc", "thiserror"},
+        "aw-host": {"aw-config", "aw-exec", "aw-provider", "serde_json", "sha2", "thiserror"},
+        "aw-service": {"aw-config", "aw-core", "aw-exec", "aw-host", "aw-provider", "libc", "serde", "serde_json", "sha2", "thiserror"},
     }
     members = {
         p["name"]: p for p in metadata["packages"] if p["id"] in metadata["workspace_members"]
@@ -176,7 +185,7 @@ def structure(metadata: dict, root: Path) -> None:
         for dependency in package["dependencies"]:
             if dependency["name"] not in allowed[name]:
                 raise ValueError(f"{name}: unreviewed dependency {dependency['name']}")
-            local = {"aw-contracts": root, "aw-config": root / "crates/aw-config"}
+            local = {name: root if name == "aw-contracts" else root / "crates" / name for name in allowed}
             if dependency["name"] in local:
                 path = dependency.get("path")
                 if (
@@ -209,7 +218,7 @@ def structure(metadata: dict, root: Path) -> None:
                     print(f"AW layout: {relative}: {lines} lines (ceiling {limit})", flush=True)
 
 
-def selftest() -> None:
+def selftest(scope_only: bool = False) -> None:
     """Run the gate's behavior tests, rejecting missing or empty discovery."""
     run(
         [
@@ -220,6 +229,8 @@ def selftest() -> None:
 import sys
 import unittest
 suite = unittest.defaultTestLoader.discover('tests', pattern='test_ci_checks.py')
+if sys.argv[1] == "scope":
+    suite = unittest.defaultTestLoader.loadTestsFromName("test_ci_checks.ScopeTests")
 if suite.countTestCases() == 0:
     raise SystemExit('AW gate self-tests are missing or empty')
 result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -227,6 +238,7 @@ if result.testsRun == len(result.skipped):
     raise SystemExit('AW gate self-tests were all skipped')
 sys.exit(not result.wasSuccessful())
 """,
+            "scope" if scope_only else "all",
         ],
         AW,
         timeout=120,
@@ -287,7 +299,7 @@ def main() -> int:
     try:
         if command == "scope":
             actual = candidate()
-            selftest()
+            selftest(scope_only=True)
             event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
             selected = scope(os.environ["GITHUB_EVENT_NAME"], event, actual)
             output(selected=str(selected).lower(), candidate_sha=actual)

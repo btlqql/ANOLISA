@@ -506,30 +506,8 @@ impl GenAISqliteStore {
                 };
 
                 // Extract tool_call_ids from response messages (outgoing tool calls)
-                let tool_call_ids: Option<String> = {
-                    let ids: Vec<String> = call
-                        .response
-                        .messages
-                        .iter()
-                        .flat_map(|m| m.parts.iter())
-                        .filter_map(|p| {
-                            if let crate::genai::semantic::MessagePart::ToolCall {
-                                id: Some(tc_id),
-                                ..
-                            } = p
-                            {
-                                Some(tc_id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if ids.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&ids).ok()
-                    }
-                };
+                let tool_call_ids =
+                    crate::genai::semantic::tool_call_ids_json(&call.response.messages);
 
                 // Get instance ID (same logic as SLS uploader)
                 let instance = crate::genai::instance_id::get_instance_id();
@@ -604,7 +582,7 @@ impl GenAISqliteStore {
             GenAISemanticEvent::ToolUse(tool) => {
                 conn.execute(
                     "INSERT INTO genai_events (
-                        event_type, call_id, timestamp_ns, pid,
+                        event_type, call_id, start_timestamp_ns, pid,
                         event_json
                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
@@ -619,7 +597,7 @@ impl GenAISqliteStore {
             GenAISemanticEvent::AgentInteraction(interaction) => {
                 conn.execute(
                     "INSERT INTO genai_events (
-                        event_type, timestamp_ns, pid,
+                        event_type, start_timestamp_ns, pid,
                         event_json
                     ) VALUES (?1, ?2, ?3, ?4)",
                     params![
@@ -633,7 +611,7 @@ impl GenAISqliteStore {
             GenAISemanticEvent::StreamChunk(chunk) => {
                 conn.execute(
                     "INSERT INTO genai_events (
-                        event_type, call_id, timestamp_ns, pid,
+                        event_type, call_id, start_timestamp_ns, pid,
                         event_json
                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![

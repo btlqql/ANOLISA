@@ -11,6 +11,7 @@ use asc_daemon_service::{DispatchError, DispatchRequest, RequestDispatcher, Resp
 use crate::action::CodeScanHandler;
 use crate::pap::PapHandler;
 use crate::pii::PiiScanHandler;
+use crate::prompt_scan::PromptScanHandler;
 
 /// Protocol router composed over daemon application use cases.
 pub struct DaemonDispatcher {
@@ -18,7 +19,9 @@ pub struct DaemonDispatcher {
     code_scan: CodeScanHandler,
     pii_scan: PiiScanHandler,
     skill_sec: crate::skill_sec::SkillSecHandler,
+    prompt_scan: PromptScanHandler,
     principal_policy: Arc<dyn PrincipalPolicy>,
+    observability: Option<asc_daemon_core::ObservabilityService>,
 }
 
 impl DaemonDispatcher {
@@ -35,9 +38,18 @@ impl DaemonDispatcher {
             pap: PapHandler::new(application),
             code_scan: CodeScanHandler::new(Arc::clone(&actions)),
             pii_scan: PiiScanHandler::new(Arc::clone(&actions)),
-            skill_sec: crate::skill_sec::SkillSecHandler::new(actions),
+            skill_sec: crate::skill_sec::SkillSecHandler::new(Arc::clone(&actions)),
+            prompt_scan: PromptScanHandler::new(actions),
             principal_policy,
+            observability: None,
         }
+    }
+
+    /// Installs the explicitly configured observability ingestion application.
+    #[must_use]
+    pub fn with_observability(mut self, service: asc_daemon_core::ObservabilityService) -> Self {
+        self.observability = Some(service);
+        self
     }
 
     /// Handles one decoded request using transport-authenticated peer identity.
@@ -97,6 +109,12 @@ impl DaemonDispatcher {
             );
         }
         match method_id {
+            MethodId::ObservabilityRecord => crate::observability::handle(
+                request_id,
+                control,
+                self.observability.as_ref(),
+                request.params,
+            ),
             MethodId::Pap(method) => {
                 self.pap
                     .handle(request_id, &principal, method, request.params)
@@ -113,6 +131,13 @@ impl DaemonDispatcher {
                 method::ActionMethod::PiiScan => {
                     self.pii_scan
                         .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::PromptScan => {
+                    self.prompt_scan
+                        .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::PromptScanWarmup => {
+                    self.prompt_scan.handle_warmup(request_id, request.params)
                 }
             },
         }
@@ -132,6 +157,21 @@ fn is_authorized(principal: &Principal, access: AccessPolicy) -> bool {
 impl RequestDispatcher for DaemonDispatcher {
     fn dispatch_timeout(&self, payload: &[u8]) -> Option<std::time::Duration> {
         let request: DaemonRequest = serde_json::from_slice(payload).ok()?;
+        // Prompt Scanner retains its existing fixed local-model budget.
+        if request.method == method::ACTION_PROMPT_SCAN
+            || request.method == method::ACTION_PROMPT_SCAN_WARMUP
+        {
+            return Some(std::time::Duration::from_secs(35));
+        }
+        if request.method == method::ACTION_CODE_SCAN
+            && request
+                .params
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("llm")
+        {
+            return Some(asc_model_client::code_scan_budget());
+        }
         if request.method != method::ACTION_SKILL_SEC {
             return None;
         }

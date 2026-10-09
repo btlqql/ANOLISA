@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { roundMatchesText } from '../utils/trajectoryTextFilter';
 import { useSearchParams } from 'react-router-dom';
 import type {
   AtifDocument, AtifStep, AtifToolCall, AtifObservation, AtifStepMetrics,
@@ -16,6 +17,9 @@ import {
 } from '../utils/trajectoryTree';
 import { useI18n, useLocaleTag } from '../i18n';
 import type { MessageKey } from '../i18n';
+import type { Round } from '../utils/roundModel';
+import { groupIntoRounds, initialRound, roundStats } from '../utils/roundModel';
+import { compoundedSavingsRate } from '../utils/savings';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -82,52 +86,9 @@ function highlightedSections(doc: AtifDocument, callId: string | null): Set<stri
 }
 
 // ─── Round grouping ───────────────────────────────────────────────────────────
-// A "round" starts at each user step and spans the following agent/system steps,
-// mirroring the round-based trajectory view in agentopt.
-
-interface Round {
-  key: number;
-  label: string;
-  /** True for the synthetic leading round that only carries the system prompt.
-   *  Kept separate from `label` so consumers never branch on translated text. */
-  isPreamble: boolean;
-  userStep: AtifStep | null;
-  steps: AtifStep[];
-}
-
-function groupIntoRounds(steps: AtifStep[], t: (key: MessageKey, params?: Record<string, string | number>) => string): Round[] {
-  const rounds: Round[] = [];
-  let userRoundCount = 0;
-  for (const step of steps) {
-    if (step.source === 'user' || rounds.length === 0) {
-      const isUser = step.source === 'user';
-      if (isUser) userRoundCount++;
-      rounds.push({
-        key: rounds.length,
-        label: isUser ? t('atif.round', { n: userRoundCount }) : t('atif.preamble'),
-        isPreamble: !isUser,
-        userStep: isUser ? step : null,
-        steps: [step],
-      });
-    } else {
-      rounds[rounds.length - 1].steps.push(step);
-    }
-  }
-  return rounds;
-}
-
-/** Round to auto-select: prefer the highlighted round, else the first round. */
-function initialRound(rounds: Round[], sections: Set<string>): number | null {
-  if (rounds.length === 0) return null;
-  if (sections.size > 0) {
-    const stepIds = new Set<number>();
-    sections.forEach(k => stepIds.add(parseInt(k, 10)));
-    for (const round of rounds) {
-      if (round.steps.some(s => stepIds.has(s.step_id))) return round.key;
-    }
-  }
-  return rounds[0].key;
-}
+// The round model (grouping, initial highlighted/default selection and
+// per-round statistics) lives in ../utils/roundModel; the viewer keeps
+// fetching, importing, navigation and rendering.
 
 // ─── Strategy label config (shared with TokenSavingsPage) ────────────────────
 
@@ -459,27 +420,6 @@ const ToolCallItem: React.FC<{ tc: AtifToolCall; savingsMap?: Map<string, Optimi
 
 // ─── Round list item (left column) ──────────────────────────────────────────
 
-interface RoundStats {
-  toolCallCount: number;
-  promptSum: number;
-  completionSum: number;
-  firstTs?: string;
-  preview: string;
-}
-
-function roundStats(round: Round): RoundStats {
-  let toolCallCount = 0, promptSum = 0, completionSum = 0;
-  for (const s of round.steps) {
-    toolCallCount += toolCallsOf(s).length;
-    promptSum += s.metrics?.prompt_tokens ?? 0;
-    completionSum += s.metrics?.completion_tokens ?? 0;
-  }
-  const preview = (round.userStep?.message ?? round.steps.find(s => s.message)?.message ?? '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return { toolCallCount, promptSum, completionSum, firstTs: round.steps.find(s => s.timestamp)?.timestamp, preview };
-}
-
 interface RoundListItemProps {
   round: Round;
   isActive: boolean;
@@ -668,6 +608,10 @@ export const AtifViewerPage: React.FC = () => {
     (searchParams.get('type') as 'session' | 'conversation') || 'session'
   );
   const [queryId, setQueryId] = useState(searchParams.get('id') || '');
+  // Query that produced the document on screen, as opposed to the live form
+  // fields: editing the input without pressing Load must not retarget the
+  // causal panel (or store its history under an id that was never loaded).
+  const [loadedQuery, setLoadedQuery] = useState<{ type: 'session' | 'conversation'; id: string } | null>(null);
 
   // Data state
   const [doc, setDoc] = useState<AtifDocument | null>(null);
@@ -684,6 +628,7 @@ export const AtifViewerPage: React.FC = () => {
   // UI state
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
   const [selectedRound, setSelectedRound] = useState<number | null>(null);
+  const [roundFilter, setRoundFilter] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Subagent navigation: a trajectory-id path from the root, mirrored in the URL
@@ -694,6 +639,10 @@ export const AtifViewerPage: React.FC = () => {
   const tree = React.useMemo(() => buildTrajectoryTree(doc), [doc]);
   const selectedNode = tree ? findNodeByPath(tree, nodePath) : null;
   const activeDoc = selectedNode?.doc ?? doc;
+
+  useEffect(() => {
+    setRoundFilter('');
+  }, [activeDoc]);
 
   const selectNode = useCallback((node: TrajNode) => {
     // Subagents referenced by session id only (never embedded) still live on
@@ -782,6 +731,7 @@ export const AtifViewerPage: React.FC = () => {
       }
       if (requestId !== loadRequestIdRef.current) return;
       setDoc(data);
+      setLoadedQuery({ type: qt, id: i.trim() });
       const sections = highlightedSections(data, nextParams.highlight_call_id ?? null);
       setExpandedSections(sections);
       // Round selection follows the node the URL restored, not always the root.
@@ -838,8 +788,15 @@ export const AtifViewerPage: React.FC = () => {
   const handleFileImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // Local imports share the load identity with network loads: taking the
+    // next request id invalidates any in-flight network response (and any
+    // earlier import), and this read is in turn invalidated by a newer load.
+    const requestId = ++loadRequestIdRef.current;
+    setLoading(true);
+    setError(null);
     const reader = new FileReader();
     reader.onload = (ev) => {
+      if (requestId !== loadRequestIdRef.current) return;
       try {
         const parsed = JSON.parse(ev.target?.result as string);
         if (!parsed.schema_version || !String(parsed.schema_version).startsWith('ATIF')) {
@@ -850,11 +807,20 @@ export const AtifViewerPage: React.FC = () => {
         setNodePath([]);
         setError(null);
         setQueryId(parsed.session_id ?? '');
+        setLoadedQuery({ type: 'session', id: parsed.session_id ?? '' });
         setExpandedSections(new Set());
         setSelectedRound(initialRound(groupIntoRounds(stepsOf(parsed as AtifDocument), t), new Set()));
       } catch {
         setError(t('atif.jsonParseFailed'));
+      } finally {
+        // Only the current load may finish its own loading state.
+        if (requestId === loadRequestIdRef.current) setLoading(false);
       }
+    };
+    reader.onerror = () => {
+      if (requestId !== loadRequestIdRef.current) return;
+      setError(t('atif.loadFailed'));
+      setLoading(false);
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -875,6 +841,10 @@ export const AtifViewerPage: React.FC = () => {
   // Compute metrics (fallback when final_metrics is partial)
   const steps = activeDoc?.steps ?? [];
   const rounds = React.useMemo(() => groupIntoRounds(activeDoc?.steps ?? [], t), [activeDoc, t]);
+  const visibleRounds = React.useMemo(
+    () => rounds.filter((round) => roundMatchesText(round.steps, roundFilter)),
+    [rounds, roundFilter],
+  );
   const activeRound = rounds.find(r => r.key === selectedRound) ?? null;
   const computedMetrics = activeDoc ? (() => {
     const fm = activeDoc.final_metrics;
@@ -1050,7 +1020,10 @@ export const AtifViewerPage: React.FC = () => {
                     <p className="text-xl font-bold text-green-600">
                       {fmtTokens(savingsDetail.total_compounded_saved)}
                       <span className="text-sm font-normal text-gray-400 ml-1">
-                        ({(savingsDetail.savings_rate * 100).toFixed(1)}%)
+                        ({compoundedSavingsRate(
+                          savingsDetail.total_compounded_saved,
+                          savingsDetail.total_original_tokens,
+                        ).toFixed(1)}%)
                       </span>
                     </p>
                   </div>
@@ -1108,7 +1081,22 @@ export const AtifViewerPage: React.FC = () => {
                 <div className="grid grid-cols-1 lg:grid-cols-[minmax(240px,1fr)_2fr_minmax(300px,380px)] gap-4 items-start">
                   {/* Left: round list */}
                   <div className="space-y-2 lg:max-h-[calc(100vh-200px)] lg:overflow-y-auto lg:sticky lg:top-4 pr-1">
-                    {rounds.map(round => (
+                    <div className="bg-white rounded-xl border border-gray-200 p-3 space-y-2">
+                      <input
+                        type="search"
+                        value={roundFilter}
+                        onChange={(event) => setRoundFilter(event.target.value)}
+                        aria-label={t('atif.filterRounds')}
+                        placeholder={t('atif.filterRounds')}
+                        className="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                      />
+                      <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                        <span aria-live="polite">{t('atif.matchingRounds', { matched: visibleRounds.length, total: rounds.length })}</span>
+                        {roundFilter && <button onClick={() => setRoundFilter('')} className="text-blue-600 hover:text-blue-800">{t('atif.clearRoundFilter')}</button>}
+                      </div>
+                    </div>
+                    {visibleRounds.length === 0 && <p className="p-4 text-sm text-gray-500">{t('atif.noMatchingRounds')}</p>}
+                    {visibleRounds.map(round => (
                       <RoundListItem
                         key={round.key}
                         round={round}
@@ -1138,11 +1126,11 @@ export const AtifViewerPage: React.FC = () => {
                   {/* Right: causal attribution panel */}
                   <div className="lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
                     <CausalAttributionPanel
-                      sessionId={queryId}
+                      sessionId={loadedQuery?.id ?? ''}
                       roundIndex={selectedRound ?? undefined}
                       roundLabel={activeRound?.label}
                       isPreambleRound={activeRound?.isPreamble ?? false}
-                      idKind={queryType}
+                      idKind={loadedQuery?.type}
                     />
                   </div>
                 </div>

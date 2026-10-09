@@ -139,6 +139,21 @@ optimization type, plus a savings ranking and concrete tips.
 Press **Query** after choosing a range; the page starts empty on purpose. Setup:
 [Integrations](integrations.md#tokenless-token-savings).
 
+**Export CSV** downloads the displayed sessions from the last successful query as
+`token-savings.csv`, in their displayed order. It includes session IDs, Agent names,
+request counts and Token metrics; rates use fractions (for example, `0.4` means 40%).
+The export omits tool content and uses UTF-8 with a BOM for spreadsheet compatibility.
+Text beginning with a spreadsheet formula prefix is prefixed with an apostrophe.
+Export is disabled while querying, after a query error, or when there are no sessions.
+
+To compare a subset, check the box on each session row (or the box in the table header
+to select or clear every session) and press **Export Selected (N)**. The download uses
+the same columns, escaping, units and file lifecycle as the full export, keeps the
+displayed row order, and reads only the already loaded results — it never issues another
+request. Checking a box does not expand or collapse the row; the selection is keyed by
+session ID, and it is cleared whenever a new successful query replaces the snapshot.
+The button stays disabled while querying, after a query error, or while nothing is selected.
+
 ## Optimization
 
 Runs LLM-assisted analysis over one session in six dimensions: `perf`, `perf-issues`, `cost`,
@@ -173,6 +188,12 @@ elsewhere.
 ![Trajectory Viewer for one session](../../../../images/agentsight/en/dashboard-session-trajectory.png)
 
 This is the page to open when you need to know exactly what the Agent sent and received.
+
+**Filter round content** searches the currently selected trajectory locally. It matches a
+case-insensitive literal substring in messages, reasoning, tool names, arguments, and result content,
+and shows the matching/total round count. **Clear filter** restores the full list. The selected round
+detail stays visible while filtering; selecting another trajectory or importing/loading a new
+document clears the filter. Searching sends no model request and leaves **Download JSON** unchanged.
 
 ## Settings
 

@@ -271,6 +271,10 @@ const enUSMessages = {
   'ts.compoundedSavings': 'Compounded savings {n} tokens',
   'ts.singleTurn': '(single-turn {pct}%)',
   'ts.sessionId': 'Session ID',
+  'ts.exportCsv': 'Export CSV',
+  'ts.exportSelectedCsv': 'Export Selected ({n})',
+  'ts.selectSessionForExport': 'Select session {id} for CSV export',
+  'ts.selectAllSessions': 'Select all sessions',
   'ts.inputTokens': 'Input Tokens',
   'ts.outputTokens': 'Output Tokens',
   'ts.savingsRateCol': 'Savings Rate',
@@ -315,6 +319,10 @@ const enUSMessages = {
   'atif.actualTokens': 'Actual Tokens (optimized)',
   'atif.interactionTrajectory': 'Interaction Trajectory',
   'atif.roundsSteps': '{rounds} rounds · {steps} steps',
+  'atif.filterRounds': 'Filter round content',
+  'atif.matchingRounds': '{matched} of {total} rounds',
+  'atif.clearRoundFilter': 'Clear filter',
+  'atif.noMatchingRounds': 'No rounds match this text.',
   'atif.noStepData': 'No step data in this trajectory',
   'atif.clickRoundToView': 'Click a round on the left to view details',
   'atif.noMessageContent': 'No message content',
@@ -1402,6 +1410,10 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'ts.compoundedSavings': '复合节省 {n} tokens',
     'ts.singleTurn': '（单轮 {pct}%）',
     'ts.sessionId': 'Session ID',
+    'ts.exportCsv': '导出 CSV',
+    'ts.exportSelectedCsv': '导出所选（{n}）',
+    'ts.selectSessionForExport': '选择会话 {id} 用于 CSV 导出',
+    'ts.selectAllSessions': '全选会话',
     'ts.inputTokens': '输入 Tokens',
     'ts.outputTokens': '输出 Tokens',
     'ts.savingsRateCol': '节省率',
@@ -1446,6 +1458,10 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'atif.actualTokens': '实际 Tokens（已优化）',
     'atif.interactionTrajectory': '交互轨迹',
     'atif.roundsSteps': '{rounds} 轮 · {steps} 步',
+    'atif.filterRounds': '筛选轮次内容',
+    'atif.matchingRounds': '匹配 {matched} 轮，共 {total} 轮',
+    'atif.clearRoundFilter': '清除筛选',
+    'atif.noMatchingRounds': '没有轮次匹配此文本。',
     'atif.noStepData': '该轨迹暂无步骤数据',
     'atif.clickRoundToView': '点击左侧的轮次查看详情',
     'atif.noMessageContent': '无消息内容',
@@ -2376,6 +2392,24 @@ export function localeTag(locale: Locale): string {
   return locale;
 }
 
+/**
+ * Substitutes `{name}` placeholders in a message template.
+ *
+ * Parameter values are opaque data, so the substitution is a single pass over
+ * the template: a value is never scanned for placeholders (`{n}` inside a
+ * value stays literal) and, because the replacer is a function rather than a
+ * replacement string, `$&`, `$'`, `$`` and `$$` inside a value survive too.
+ */
+export function interpolateMessage(
+  template: string,
+  params?: Record<string, string | number>,
+): string {
+  if (!params) return template;
+  return template.replace(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (placeholder, name) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder,
+  );
+}
+
 export const I18nProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
   const [locale, setLocaleState] = useState<Locale>(resolveInitialLocale);
 
@@ -2394,15 +2428,8 @@ export const I18nProvider: React.FC<React.PropsWithChildren> = ({ children }) =>
   }, []);
 
   const t = useCallback(
-    (key: MessageKey, params?: Record<string, string | number>) => {
-      let msg = messages[locale][key];
-      if (params) {
-        for (const [k, v] of Object.entries(params)) {
-          msg = msg.replace(new RegExp(`\\{${k}\\}`, 'g'), String(v));
-        }
-      }
-      return msg;
-    },
+    (key: MessageKey, params?: Record<string, string | number>) =>
+      interpolateMessage(messages[locale][key], params),
     [locale],
   );
 

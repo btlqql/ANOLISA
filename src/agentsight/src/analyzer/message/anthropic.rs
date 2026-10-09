@@ -228,23 +228,40 @@ impl AnthropicParser {
                         if let Some(block) = current_block.take() {
                             finish_block(block, &mut content_blocks);
                         }
-                        // Begin a new content block based on its type
+                        // A compatible gateway may send the block's complete
+                        // payload on `content_block_start` and no deltas at
+                        // all; starting from empty buffers used to record an
+                        // empty tool call or drop the text/thinking. The
+                        // standard stream starts every block empty, so seeding
+                        // is a no-op there. A tool_use's empty `input` object
+                        // is the placeholder the deltas replace, so it must
+                        // not be serialized into the buffer.
                         current_block = match content_block {
-                            AnthropicContentBlock::ToolUse { id, name, .. } => {
+                            AnthropicContentBlock::ToolUse { id, name, input } => {
                                 Some(CurrentBlock::ToolUse {
                                     id: id.clone(),
                                     name: name.clone(),
-                                    input_json: String::new(),
+                                    input_json: match input {
+                                        serde_json::Value::Null => String::new(),
+                                        serde_json::Value::Object(map) if map.is_empty() => {
+                                            String::new()
+                                        }
+                                        value => value.to_string(),
+                                    },
                                 })
                             }
-                            AnthropicContentBlock::Thinking { .. } => {
-                                Some(CurrentBlock::Thinking {
-                                    thinking: String::new(),
-                                    signature: String::new(),
-                                })
+                            AnthropicContentBlock::Thinking {
+                                thinking,
+                                signature,
+                            } => Some(CurrentBlock::Thinking {
+                                thinking: thinking.clone(),
+                                signature: signature.clone().unwrap_or_default(),
+                            }),
+                            AnthropicContentBlock::Text { text, .. } => {
+                                Some(CurrentBlock::Text { text: text.clone() })
                             }
                             _ => {
-                                // Text or any other block type
+                                // Any other block type
                                 Some(CurrentBlock::Text {
                                     text: String::new(),
                                 })
@@ -307,7 +324,15 @@ impl AnthropicParser {
                         delta,
                         usage: delta_usage,
                     } => {
-                        stop_reason = delta.stop_reason.clone();
+                        // A stream may carry several message_delta events (interim
+                        // usage; some proxies emit a usage-only terminal delta
+                        // after the one that carried the stop_reason). The usage
+                        // counters below merge with max for exactly that reason;
+                        // the stop_reason must not regress to None when a later
+                        // delta omits it.
+                        if delta.stop_reason.is_some() {
+                            stop_reason = delta.stop_reason.clone();
+                        }
                         if let Some(du) = delta_usage {
                             // Counters are cumulative and split across events:
                             // official Anthropic puts input+cache in
@@ -770,6 +795,73 @@ mod tests {
         );
     }
 
+    /// A gateway may send the complete block payload on `content_block_start`
+    /// and no deltas at all. The buffers used to start empty, so such a
+    /// stream recorded a tool call with `arguments = {}`.
+    #[test]
+    fn test_aggregate_sse_keeps_tool_input_from_content_block_start() {
+        let events = serde_json::json!([
+            {"type": "message_start", "message": {
+                "id": "msg_seed", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "content": [],
+                "usage": {"input_tokens": 10, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file",
+                               "input": {"path": "/tmp/a"}}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+             "usage": {"output_tokens": 5}}
+        ]);
+
+        let resp = AnthropicParser::parse_response(&events).expect("the stream must aggregate");
+        assert_eq!(resp.content.len(), 1);
+        match &resp.content[0] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"path": "/tmp/a"}),
+                    "the start block's complete input must not be discarded"
+                );
+            }
+            other => panic!("Expected ToolUse, got {other:?}"),
+        }
+    }
+
+    /// Same shape for text and thinking: the start block's payload must seed
+    /// the buffer when the gateway sends no deltas.
+    #[test]
+    fn test_aggregate_sse_keeps_text_and_thinking_from_content_block_start() {
+        let events = serde_json::json!([
+            {"type": "message_start", "message": {
+                "id": "msg_seed2", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "content": [],
+                "usage": {"input_tokens": 10, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "thinking", "thinking": "consider this"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1,
+             "content_block": {"type": "text", "text": "the answer"}},
+            {"type": "content_block_stop", "index": 1},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 5}}
+        ]);
+
+        let resp = AnthropicParser::parse_response(&events).expect("the stream must aggregate");
+        assert_eq!(resp.content.len(), 2);
+        match &resp.content[0] {
+            AnthropicContentBlock::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "consider this")
+            }
+            other => panic!("Expected Thinking, got {other:?}"),
+        }
+        match &resp.content[1] {
+            AnthropicContentBlock::Text { text, .. } => assert_eq!(text, "the answer"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_aggregate_sse_with_tool_use() {
         let events = serde_json::json!([
@@ -956,6 +1048,38 @@ mod tests {
         );
         assert_eq!(resp.usage.cache_creation_input_tokens, Some(0));
         assert_eq!(resp.usage.cache_read_input_tokens, Some(24576));
+    }
+
+    /// Anthropic-compatible gateways may emit several `message_delta` events
+    /// (interim usage, or a second terminal usage-only delta after the one
+    /// that carried `stop_reason`). The usage merge takes the max of each
+    /// counter for exactly that reason, but the `stop_reason` assignment
+    /// overwrote unconditionally, so a later delta without a `stop_reason`
+    /// erased the recorded terminal reason.
+    #[test]
+    fn test_aggregate_sse_keeps_stop_reason_across_later_usage_deltas() {
+        let events = serde_json::json!([
+            {"type": "message_start", "message": {
+                "id": "msg_sr", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "content": [],
+                "usage": {"input_tokens": 10, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": "hi"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 5}},
+            {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 5}}
+        ]);
+
+        let resp = AnthropicParser::parse_response(&events).expect("the stream must aggregate");
+        assert_eq!(
+            resp.stop_reason.as_deref(),
+            Some("end_turn"),
+            "a later usage-only message_delta must not erase the stop_reason"
+        );
+        assert_eq!(resp.usage.output_tokens, 5);
     }
 
     /// Test: SSE stream with multiple tool calls

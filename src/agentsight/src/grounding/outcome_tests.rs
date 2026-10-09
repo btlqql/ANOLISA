@@ -126,6 +126,18 @@ fn t7_placeholder_payload_is_unknown_not_ok() {
     assert_eq!(v.matched_rule, "B8");
 }
 
+#[test]
+fn a_read_that_quotes_the_placeholder_marker_is_not_unknown() {
+    // A successful Read of this very source quotes the marker inside a larger
+    // payload. The call produced output, so B8 must not swallow it into
+    // Unknown and drop the observation from the evidence pool.
+    let payload = "src/agentsight/src/grounding/outcome.rs\n\
+                   const PLACEHOLDER_MARKERS: &[&str] = &[\"pending-post-tool-use\"];\n\
+                   fn is_placeholder_or_empty(text: &str) -> bool {";
+    let v = classify(&plain_call(), payload);
+    assert_eq!(v.status, CallStatus::Ok, "rule={}", v.matched_rule);
+}
+
 // ---------------------------------------------------------------------------
 // R0 / R4 / R5 and their guards
 // ---------------------------------------------------------------------------
@@ -215,6 +227,66 @@ fn probe_chain_of_only_probes_is_expected() {
 }
 
 #[test]
+fn bracket_probe_is_expected() {
+    // `[` and `[[` are the POSIX and bash spellings of `test`: a single
+    // bracket probe that exits non-zero is the answer, not a fault (spec B3).
+    let v = classify(&bash_call("[ -f /var/log/app.log ]"), "Exit code 1");
+    assert_eq!(v.status, CallStatus::OkProbe, "rule={}", v.matched_rule);
+    assert_eq!(v.matched_rule, "B3");
+
+    let v = classify(&bash_call("[[ -f /var/log/app.log ]]"), "Exit code 1");
+    assert_eq!(v.status, CallStatus::OkProbe, "rule={}", v.matched_rule);
+    assert_eq!(v.matched_rule, "B3");
+}
+
+#[test]
+fn redirected_probe_is_still_expected() {
+    // `2>&1`, `>&2` and `&>` are redirections, not chains. Splitting on the raw
+    // `&` left a stray segment ("1") whose head is not a probe command, so a
+    // probe whose non-zero exit is the answer was graded as a real failure.
+    for command in [
+        "ls /nope 2>&1",
+        "ls /nope >/dev/null 2>&1",
+        "pgrep -f agent &>/dev/null",
+        "ls /nope 1>&2",
+    ] {
+        let v = classify(
+            &bash_call(command),
+            "ls: cannot access '/nope': No such file or directory\nExit code 2",
+        );
+        assert_eq!(
+            v.status,
+            CallStatus::OkProbe,
+            "{command} graded as {} ({:?})",
+            v.matched_rule,
+            v.status
+        );
+        assert_eq!(v.matched_rule, "B3", "{command}");
+    }
+}
+
+#[test]
+fn backgrounded_probe_chain_with_a_real_command_is_not_a_probe() {
+    // A bare `&` still separates: the second command is real work, so a
+    // non-zero exit may be its failure.
+    let v = classify(
+        &bash_call("ls /nope & cat /etc/missing"),
+        "cat: /etc/missing: No such file or directory\nExit code 1",
+    );
+    assert_eq!(v.status, CallStatus::Failed);
+}
+
+#[test]
+fn redirection_before_a_real_command_still_splits() {
+    // Tolerating the redirection must not swallow the separator that follows it.
+    let v = classify(
+        &bash_call("ls /nope 2>&1 && rm -rf /tmp/cache"),
+        "rm: cannot remove '/tmp/cache': No such file or directory\nExit code 1",
+    );
+    assert_eq!(v.status, CallStatus::Failed);
+}
+
+#[test]
 fn multiline_command_with_a_real_segment_is_not_a_probe() {
     // Newlines chain commands exactly like `;` and `&&` do. Splitting only on
     // the ASCII separators judged the whole script by its first line's head,
@@ -287,6 +359,30 @@ fn alternate_exit_code_wordings_are_structured_evidence() {
         "src/a.rs: error handling\n(Command exited with code 0)",
     );
     assert_eq!(v.status, CallStatus::Ok);
+}
+
+/// A successful call whose *output* quotes the exit-code wording is not that
+/// call's failure. A `Read` of a file that merely mentions `Exit code 1` — this
+/// repository's own `outcome_tests.rs`, `grader/evidence.rs` and
+/// `reuse/summarize.rs` all do — was classified `Failed` from the quoted text,
+/// which dropped the whole observation from the evidence pool and turned the
+/// paths the file names into apparently fabricated ones.
+#[test]
+fn a_quoted_exit_code_is_not_this_calls_failure() {
+    let v = classify(
+        &plain_call(),
+        "// Exit code 1 is returned when the check fails.\nfn main() {}",
+    );
+    assert_eq!(v.status, CallStatus::Ok, "rule={}", v.matched_rule);
+    assert_eq!(v.matched_rule, "default");
+
+    // A reader that prefixes every line (Claude Code's `Read` numbers them)
+    // embeds the quoted marker mid-line, where it is not this call's report.
+    let v = classify(
+        &plain_call(),
+        "    58→            \"Exit code 255\\nssh: connect failed: Bad file descriptor\",",
+    );
+    assert_eq!(v.status, CallStatus::Ok, "rule={}", v.matched_rule);
 }
 
 #[test]

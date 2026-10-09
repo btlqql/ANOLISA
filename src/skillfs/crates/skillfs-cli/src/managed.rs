@@ -26,7 +26,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,68 @@ pub struct ManagedState {
     pub desired_state: DesiredState,
 }
 
+/// Sequence that makes every staging path unique inside this process.
+static STATE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many staging names one save may try before giving up. A name can only
+/// be taken by an entry stranded by a crashed save under the same pid.
+const MAX_STAGING_ATTEMPTS: usize = 16;
+
+/// Create the exclusive staging file for one state save, next to `path`.
+///
+/// The name carries the target's file name plus the pid (separating
+/// processes) and a fresh sequence number from `counter` (separating saves
+/// inside one process, threads included), so no two saves ever share a path
+/// and no call can unlink, write through, or publish another call's staging
+/// entry. `create_new` refuses to write through an entry already sitting at
+/// a candidate name — a planted symlink included — and the next name is used
+/// instead; only the writer that created a staging file may remove it.
+///
+/// `counter` is a parameter (and production passes the process-global
+/// [`STATE_STAGING_SEQUENCE`]) so the security tests can inject a private
+/// counter and know the exact candidate names their save will try,
+/// independently of what other tests running in parallel do to the global
+/// one — a pre-planted entry is then guaranteed to be hit, not merely
+/// likely.
+fn create_staging_file(
+    path: &Path,
+    counter: &AtomicU64,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "state path has no parent directory to stage in",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "state path has no file name to stage under",
+        )
+    })?;
+    let prefix = file_name.to_string_lossy();
+    for _ in 0..MAX_STAGING_ATTEMPTS {
+        let candidate = dir.join(format!(
+            ".{prefix}.{}.{}.tmp",
+            std::process::id(),
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "every candidate staging path for the managed state file is taken",
+    ))
+}
+
 impl ManagedState {
     fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
         let raw = std::fs::read_to_string(path)?;
@@ -83,13 +145,32 @@ impl ManagedState {
     }
 
     fn save(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        self.save_with_counter(path, &STATE_STAGING_SEQUENCE)
+    }
+
+    /// [`Self::save`] with the staging-sequence source injected. Production
+    /// always saves through [`Self::save`] and the process-global counter;
+    /// tests pass a private counter so the candidate names their save will
+    /// try are fully deterministic under default parallel `cargo test`.
+    fn save_with_counter(&self, path: &Path, counter: &AtomicU64) -> Result<(), Box<dyn Error>> {
         let raw = serde_json::to_string_pretty(self)?;
         // Write-and-rename for atomicity so a concurrent reader never sees a
-        // half-written file.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, raw)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // half-written file. Every save stages on its own exclusive path and
+        // removes only the file it created, so concurrent savers — the
+        // client, the supervisor's stopped marker, and a racing teardown —
+        // never write through or publish another call's staging entry.
+        let (tmp, mut file) = create_staging_file(path, counter)?;
+        let result = (|| {
+            use std::io::Write;
+            file.write_all(raw.as_bytes())?;
+            std::fs::rename(&tmp, path)
+        })();
+        if result.is_err() {
+            // No other save ever stages at this path, so this removes only
+            // the file this call created.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result.map_err(Into::into)
     }
 }
 
@@ -387,6 +468,19 @@ fn clear_mount(mountpoint: &Path) -> Result<(), Box<dyn Error>> {
 // Client: `skillfs mount --managed ...`
 // ---------------------------------------------------------------------------
 
+/// Whether the recorded state of a live managed instance matches the
+/// requested source and mountpoint pair.
+///
+/// Pure so the refusal can be tested without a live supervisor.
+fn active_instance_matches(
+    state: &ManagedState,
+    source_norm: &Path,
+    mountpoint_norm: &Path,
+) -> bool {
+    state.source == source_norm.to_string_lossy()
+        && state.mountpoint == mountpoint_norm.to_string_lossy()
+}
+
 /// Entry point for a managed mount request. Validates the source, writes the
 /// managed state, spawns a detached supervisor, and waits for readiness.
 pub fn run_client(
@@ -430,6 +524,35 @@ pub fn run_client(
     // incumbent over the mountpoint.
     if let Some(pid) = read_pid(&paths.supervisor_pid) {
         if pid_alive(pid) {
+            // The instance id is derived from the mountpoint, so a second
+            // `--managed` request for the same mountpoint but a different
+            // source resolves to this instance. Reporting it as "already
+            // active" would leave the caller believing the new source is
+            // served; refuse instead.
+            //
+            // The recorded state is the only proof of what the incumbent
+            // serves, so a missing or corrupt state file must not be
+            // skipped either: fail explicitly and leave the incumbent
+            // running rather than vouching for an unverified source.
+            let active = ManagedState::load(&paths.state).map_err(|e| {
+                format!(
+                    "managed supervisor (pid {pid}) is active for {} but its state \
+                     cannot be read ({e}); run `skillfs stop {}` first",
+                    normalized.display(),
+                    normalized.display()
+                )
+            })?;
+            if !active_instance_matches(&active, &source_norm, &normalized) {
+                return Err(format!(
+                    "managed mount '{}' is already active from source '{}' (requested '{}'); \
+                     run `skillfs stop {}` first",
+                    active.mountpoint,
+                    active.source,
+                    source_norm.display(),
+                    normalized.display()
+                )
+                .into());
+            }
             if is_mount_ready(&normalized) {
                 info!(
                     mountpoint = %normalized.display(),
@@ -980,6 +1103,45 @@ mod tests {
         assert_eq!(a, b, "instance id must be deterministic");
     }
 
+    /// A live supervisor pid with a missing or corrupt state file must
+    /// fail the request with the explicit state error instead of falling
+    /// through to an "already active" success: the state is the only
+    /// proof of which source the incumbent serves. (Previously a ready
+    /// mount with unreadable state reported success.)
+    #[test]
+    fn unreadable_incumbent_state_fails_instead_of_already_active() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let mountpoint = tempfile::tempdir().expect("mountpoint tempdir");
+        let normalized = normalize_mountpoint(mountpoint.path());
+        let paths = ManagedPaths::new(&instance_id_for(&normalized));
+        secure_runtime_dir().expect("runtime dir");
+        // The test process itself plays the live supervisor: its pid is
+        // alive by definition.
+        std::fs::write(&paths.supervisor_pid, std::process::id().to_string())
+            .expect("write supervisor pid");
+
+        let err = run_client(&[], source.path(), mountpoint.path())
+            .expect_err("a missing state file must fail the request");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("state cannot be read") && msg.contains("skillfs stop"),
+            "expected the explicit state-read failure, got: {msg}"
+        );
+
+        // Corrupt state fails the same way, without touching the
+        // incumbent.
+        std::fs::write(&paths.state, "{not json").expect("write corrupt state");
+        let err = run_client(&[], source.path(), mountpoint.path())
+            .expect_err("a corrupt state file must fail the request");
+        assert!(
+            err.to_string().contains("state cannot be read"),
+            "expected the explicit state-read failure, got: {err}"
+        );
+
+        std::fs::remove_file(&paths.supervisor_pid).ok();
+        std::fs::remove_file(&paths.state).ok();
+    }
+
     #[test]
     fn instance_id_differs_for_different_paths() {
         let a = instance_id_for(Path::new("/tmp/mount-a"));
@@ -1091,6 +1253,163 @@ mod tests {
         assert_eq!(parsed, DesiredState::Mounted);
     }
 
+    fn sample_state(instance_id: &str) -> ManagedState {
+        ManagedState {
+            schema_version: STATE_SCHEMA_VERSION,
+            instance_id: instance_id.to_string(),
+            mountpoint: "/mnt/skillfs".to_string(),
+            source: "/srv/skills".to_string(),
+            worker_program: "/usr/bin/skillfs".to_string(),
+            worker_args: vec![
+                "mount".to_string(),
+                "--foreground".to_string(),
+                "/srv/skills".to_string(),
+                "/mnt/skillfs".to_string(),
+            ],
+            desired_state: DesiredState::Mounted,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_publish_through_a_planted_staging_entry() {
+        // A fixed staging path makes any entry already sitting there the
+        // publication vehicle: writing through a symlink would clobber its
+        // target and rename the link itself onto the state path. Plant
+        // entries at the legacy fixed name and at the first candidates of a
+        // private counter (injected via `save_with_counter`), so the save
+        // deterministically hits every planted name — parallel tests can no
+        // longer advance the sequence between the plant and the save and
+        // leave the collision unexercised.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("mnt-0000dead.state.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        // Legacy fixed staging name (`with_extension("json.tmp")`).
+        std::os::unix::fs::symlink(&victim, state_path.with_extension("json.tmp")).unwrap();
+        let counter = AtomicU64::new(0);
+        // The first two candidates this save must refuse and skip.
+        let planted: Vec<PathBuf> = (0..2)
+            .map(|seq| {
+                dir.path().join(format!(
+                    ".mnt-0000dead.state.json.{}.{}.tmp",
+                    std::process::id(),
+                    seq
+                ))
+            })
+            .collect();
+        for candidate in &planted {
+            std::os::unix::fs::symlink(&victim, candidate).unwrap();
+        }
+
+        sample_state("mnt-0000dead")
+            .save_with_counter(&state_path, &counter)
+            .unwrap();
+
+        // The save really collided with both planted candidates: a private
+        // counter starting at 0 makes the save consume 0, 1 (refused) and
+        // then 2 (created), and exactly that.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            3,
+            "the save must have refused both planted candidates and \
+             published on the third name"
+        );
+        // The skipped entries are still the planted symlinks, untouched.
+        for candidate in &planted {
+            assert!(
+                std::fs::symlink_metadata(candidate)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "a refused candidate must be left as-is, not removed: {candidate:?}"
+            );
+        }
+        assert!(
+            !std::fs::symlink_metadata(&state_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the published state must be a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "no planted staging entry may be written through"
+        );
+        let loaded = ManagedState::load(&state_path).unwrap();
+        assert_eq!(loaded.instance_id, "mnt-0000dead");
+        assert_eq!(loaded.desired_state, DesiredState::Mounted);
+    }
+
+    #[test]
+    fn concurrent_saves_in_one_process_all_publish() {
+        // Every save must own its staging path. With one path shared by all
+        // saves in the process, concurrent callers truncate each other's
+        // staging bytes and the last rename can publish a torn file.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("mnt-0000beef.state.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let state_path = state_path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut state = sample_state("mnt-0000beef");
+                    state.mountpoint = format!("/mnt/skillfs-{worker}");
+                    barrier.wait();
+                    (0..40).filter(|_| state.save(&state_path).is_ok()).count()
+                })
+            })
+            .collect();
+        let published: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum();
+        assert_eq!(published, 320, "every concurrent save must publish");
+        // Whichever save won, the published state is complete, never torn.
+        let loaded = ManagedState::load(&state_path).unwrap();
+        assert_eq!(loaded.instance_id, "mnt-0000beef");
+        assert_eq!(loaded.desired_state, DesiredState::Mounted);
+    }
+
+    #[test]
+    fn save_leaves_a_foreign_staging_entry_alone() {
+        // Only the call that created a staging file may remove it: an entry
+        // left by a crashed save (or a concurrent writer) must survive a
+        // failing save's cleanup. The entry is planted at the first
+        // candidate of a private counter (injected via `save_with_counter`),
+        // so this save deterministically collides with it regardless of
+        // parallel tests advancing the process-global sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("mnt-0000cafe.state.json");
+        let counter = AtomicU64::new(0);
+        let foreign = dir.path().join(format!(
+            ".mnt-0000cafe.state.json.{}.0.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&foreign, "foreign leftover").unwrap();
+
+        sample_state("mnt-0000cafe")
+            .save_with_counter(&state_path, &counter)
+            .unwrap();
+
+        // The save collided with the foreign entry (candidate 0 refused)
+        // and published on the next name — exactly two counter draws.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "the save must have refused the foreign candidate and \
+             published on the next name"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            "foreign leftover",
+            "a foreign staging entry must be left alone"
+        );
+        assert!(ManagedState::load(&state_path).is_ok());
+    }
+
     #[test]
     fn current_desired_state_missing_file_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
@@ -1165,6 +1484,37 @@ mod tests {
             err.to_string().contains("symlink"),
             "expected symlink rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn active_instance_matches_only_the_recorded_source_and_mountpoint() {
+        let state = ManagedState {
+            schema_version: STATE_SCHEMA_VERSION,
+            instance_id: "abc".to_string(),
+            mountpoint: "/mnt/skills".to_string(),
+            source: "/srv/src-a".to_string(),
+            worker_program: "/usr/bin/skillfs".to_string(),
+            worker_args: vec![],
+            desired_state: DesiredState::Mounted,
+        };
+        let mnt = Path::new("/mnt/skills");
+        assert!(active_instance_matches(
+            &state,
+            Path::new("/srv/src-a"),
+            mnt
+        ));
+        // Same mountpoint, different source: the instance id collides, so the
+        // request must be refused rather than reported as already active.
+        assert!(!active_instance_matches(
+            &state,
+            Path::new("/srv/src-b"),
+            mnt
+        ));
+        assert!(!active_instance_matches(
+            &state,
+            Path::new("/srv/src-a"),
+            Path::new("/mnt/other")
+        ));
     }
 
     #[test]

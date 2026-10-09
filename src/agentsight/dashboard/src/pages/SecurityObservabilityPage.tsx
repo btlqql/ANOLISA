@@ -112,6 +112,12 @@ export const SecurityObservabilityPage: React.FC = () => {
   // race, and if A's response resolves last the drawer shows B's header with
   // A's body. Only the newest click may write the detail state.
   const eventDetailRequestIdRef = useRef(0);
+  const statusRequestIdRef = useRef(0);
+  // `sessionsLoading` is owned by the loadSessions request that raised it: the
+  // shared sessions token above can also be bumped by loadOverview, which never
+  // touches the spinner, so a superseded loadSessions must still clear its own
+  // flag or the timeline session <select> stays disabled forever.
+  const sessionsLoadingRequestIdRef = useRef(0);
 
   const isAvailable = isSecurityAvailableState(status?.state);
   const rangeParams: SecurityTimeRangeParams = useMemo(() => ({
@@ -124,18 +130,21 @@ export const SecurityObservabilityPage: React.FC = () => {
   );
 
   const loadStatus = useCallback(async () => {
+    const requestId = ++statusRequestIdRef.current;
     setStatusLoading(true);
     setStatusError(null);
     try {
       const nextStatus = await fetchSecurityStatus();
+      if (requestId !== statusRequestIdRef.current) return null;
       setStatus(nextStatus);
       return nextStatus;
     } catch (error) {
+      if (requestId !== statusRequestIdRef.current) return null;
       setStatus(null);
       setStatusError(errorMessage(error, t));
       return null;
     } finally {
-      setStatusLoading(false);
+      if (requestId === statusRequestIdRef.current) setStatusLoading(false);
     }
   }, [t]);
 
@@ -162,21 +171,26 @@ export const SecurityObservabilityPage: React.FC = () => {
     const collect = <T,>(
       result: PromiseSettledResult<SecurityApiResponse<T>>,
       setter: (value: SecurityApiResponse<T>) => void,
+      clear: () => void,
     ): SecurityApiResponse<T> | null => {
       if (result.status === 'fulfilled') {
         setter(result.value);
         return result.value;
       }
       errors.push(errorMessage(result.reason, t));
+      // Drop the previous range's payload: the banner explains the failure,
+      // but its numbers would otherwise sit under the new range's label and
+      // read as current.
+      clear();
       return null;
     };
 
-    collect(results[0] as PromiseSettledResult<SecurityApiResponse<SecuritySummary>>, setSummary);
-    collect(results[1] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setCategoryCounts);
-    collect(results[2] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setEventTypeCounts);
-    collect(results[3] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setResultCounts);
-    collect(results[4] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setVerdictCounts);
-    collect(results[5] as PromiseSettledResult<SecurityApiResponse<SecurityPaginated<SecurityEventRecord>>>, setRecentEvents);
+    collect(results[0] as PromiseSettledResult<SecurityApiResponse<SecuritySummary>>, setSummary, () => setSummary(null));
+    collect(results[1] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setCategoryCounts, () => setCategoryCounts(null));
+    collect(results[2] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setEventTypeCounts, () => setEventTypeCounts(null));
+    collect(results[3] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setResultCounts, () => setResultCounts(null));
+    collect(results[4] as PromiseSettledResult<SecurityApiResponse<SecurityCountByResponse>>, setVerdictCounts, () => setVerdictCounts(null));
+    collect(results[5] as PromiseSettledResult<SecurityApiResponse<SecurityPaginated<SecurityEventRecord>>>, setRecentEvents, () => setRecentEvents(null));
     const sessionResult = collect(
       results[6] as PromiseSettledResult<SecurityApiResponse<SecurityPaginated<SecuritySessionSummary>>>,
       (value) => {
@@ -185,6 +199,11 @@ export const SecurityObservabilityPage: React.FC = () => {
         // flight, drop this write instead of overwriting the newer range.
         if (sessionsRequestId === sessionsRequestIdRef.current) {
           setSecuritySessions(value);
+        }
+      },
+      () => {
+        if (sessionsRequestId === sessionsRequestIdRef.current) {
+          setSecuritySessions(null);
         }
       },
     );
@@ -229,6 +248,7 @@ export const SecurityObservabilityPage: React.FC = () => {
   const loadSessions = useCallback(async () => {
     if (!isAvailable) return;
     const requestId = ++sessionsRequestIdRef.current;
+    sessionsLoadingRequestIdRef.current = requestId;
     setSessionsLoading(true);
     setSessionsError(null);
     try {
@@ -244,7 +264,7 @@ export const SecurityObservabilityPage: React.FC = () => {
         setSessionsError(errorMessage(error, t));
       }
     } finally {
-      if (requestId === sessionsRequestIdRef.current) {
+      if (sessionsLoadingRequestIdRef.current === requestId) {
         setSessionsLoading(false);
       }
     }
@@ -270,8 +290,29 @@ export const SecurityObservabilityPage: React.FC = () => {
     }
   }, [t]);
 
+  // The Query button must always re-issue the request. Applying the draft
+  // filters alone is not enough: when the draft object is the same reference
+  // as the applied one, React bails out of the state write, `loadEvents` keeps
+  // its identity and the dep-driven effect above never re-fires — so after a
+  // failed fetch the button could not retry anything.
+  const queryEvents = useCallback(() => {
+    const filtersUnchanged = eventFilters === appliedEventFilters;
+    setAppliedEventFilters(eventFilters);
+    if (filtersUnchanged) {
+      loadEvents(0, eventFilters);
+    }
+  }, [appliedEventFilters, eventFilters, loadEvents]);
+
+  const clearEventFilters = useCallback(() => {
+    setEventFilters(EMPTY_EVENT_FILTERS);
+    setAppliedEventFilters(EMPTY_EVENT_FILTERS);
+  }, []);
+
   useEffect(() => {
     loadStatus();
+    return () => {
+      ++statusRequestIdRef.current;
+    };
   }, [loadStatus]);
 
   useEffect(() => {
@@ -519,7 +560,8 @@ export const SecurityObservabilityPage: React.FC = () => {
             <EventsTab
               eventFilters={eventFilters}
               setEventFilters={setEventFilters}
-              setAppliedEventFilters={setAppliedEventFilters}
+              onQuery={queryEvents}
+              onClear={clearEventFilters}
               categoryFilterOptions={categoryFilterOptions}
               resultFilterOptions={resultFilterOptions}
               verdictFilterOptions={verdictFilterOptions}

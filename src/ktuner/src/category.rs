@@ -30,10 +30,30 @@ pub fn param_subcategory(param: &str) -> &'static str {
         match param {
             // SysV shared-memory sizing knobs are a memory resource (the mem
             // filter has always special-cased kernel.shmmax); they must not
-            // fall through to the generic kernel.* "cpu" bucket.
+            // fall through to the generic kernel.* "cpu" bucket. The same
+            // holds for the other SysV IPC sizing knobs (semaphore sets,
+            // message queues): they size IPC memory, not the scheduler, so
+            // --category mem must surface their recommendations.
             "kernel.shmmax" | "kernel.shmall" | "kernel.shmmni" | "kernel.shm_rmid_forced" => {
                 "memory"
             }
+            "kernel.sem" | "kernel.msgmax" | "kernel.msgmnb" | "kernel.msgmni" => "memory",
+            // The kernel/keys quota knobs are the same memory-sizing class:
+            // the kernel charges every key's payload bytes and its entry count
+            // against them (security/keys/key.c key_quota_maxbytes=20000 /
+            // key_quota_maxkeys=200), and the keyring reference counts the
+            // pair as a memory resource — "the total amount of description
+            // and payload space that can be consumed"
+            // (Documentation/security/keys/core.rst). They are what the
+            // encrypted workloads the rules scale for consume, so the
+            // kernel.* catch-all must not label the size quota "cpu" and hide
+            // it from --category mem. The root_* pair belongs to the same
+            // documented group and carries no built-in recommendation, like
+            // kernel.msgmni above.
+            "kernel.keys.maxkeys"
+            | "kernel.keys.maxbytes"
+            | "kernel.keys.root_maxkeys"
+            | "kernel.keys.root_maxbytes" => "memory",
             "kernel.dmesg_restrict"
             | "kernel.kptr_restrict"
             | "kernel.yama.ptrace_scope"
@@ -327,6 +347,64 @@ mod tests {
         assert_eq!(param_subcategory("kernel.shmall"), "memory");
         assert_eq!(param_subcategory("kernel.shmmni"), "memory");
         assert_eq!(param_subcategory("kernel.shm_rmid_forced"), "memory");
+    }
+
+    #[test]
+    fn sysv_ipc_sizing_knobs_subcategory_is_memory() {
+        // kernel.sem / kernel.msgmax / kernel.msgmnb are the same class of
+        // SysV IPC sizing knob the classifier already routes to "memory"
+        // (kernel.shmmax & co). They have Performance recommendations, so
+        // under the old kernel.* catch-all they were counted and filtered
+        // as "cpu" — `--category mem` silently dropped them while
+        // `--category cpu` surfaced IPC queue sizing next to scheduler
+        // knobs.
+        for param in ["kernel.sem", "kernel.msgmax", "kernel.msgmnb"] {
+            assert_eq!(param_subcategory(param), "memory", "{param}");
+            assert_eq!(
+                filter_by_category(vec![rec(param)], "mem").len(),
+                1,
+                "{param} must surface under --category mem"
+            );
+            assert!(
+                filter_by_category(vec![rec(param)], "cpu").is_empty(),
+                "{param} is not a cpu knob"
+            );
+        }
+    }
+
+    #[test]
+    fn keyring_quota_knobs_subcategory_is_memory() {
+        // kernel/keys/<quota> sizes the memory-resident keyring, the same
+        // sizing class as the SysV IPC knobs above: the kernel charges a
+        // key's payload bytes and its entry count against these limits
+        // (security/keys/key.c: key_quota_maxbytes / key_quota_maxkeys), and
+        // the keyring's own reference calls them "the total amount of
+        // description and payload space that can be consumed"
+        // (Documentation/security/keys/core.rst). They have Performance
+        // recommendations, so under the kernel.* catch-all they were counted
+        // and filtered as "cpu" — `--category mem` silently dropped both
+        // quotas while `--category cpu` surfaced them next to scheduler
+        // knobs. The root_* pair is part of the same documented group ("Four
+        // new sysctl files ... for the purpose of controlling the quota
+        // limits on keys") and no rule recommends it, exactly like
+        // kernel.msgmni in the SysV arm above.
+        for param in [
+            "kernel.keys.maxkeys",
+            "kernel.keys.maxbytes",
+            "kernel.keys.root_maxkeys",
+            "kernel.keys.root_maxbytes",
+        ] {
+            assert_eq!(param_subcategory(param), "memory", "{param}");
+            assert_eq!(
+                filter_by_category(vec![rec(param)], "mem").len(),
+                1,
+                "{param} must surface under --category mem"
+            );
+            assert!(
+                filter_by_category(vec![rec(param)], "cpu").is_empty(),
+                "{param} is not a cpu knob"
+            );
+        }
     }
 
     #[test]

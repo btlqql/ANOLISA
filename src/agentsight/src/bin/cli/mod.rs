@@ -42,14 +42,6 @@ pub fn print_json<T: serde::Serialize>(value: &T) {
 #[cfg(all(feature = "server", target_os = "linux"))]
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/agentsight/config.json";
 
-/// Load `ServerAuthConfig` from the agentsight config file.
-///
-/// Falls back to defaults if the file cannot be read or parsed.
-#[cfg(all(feature = "server", target_os = "linux"))]
-pub fn load_server_auth_config(config_path: &str) -> agentsight::config::ServerAuthConfig {
-    load_server_config(config_path).server_auth
-}
-
 /// Loads the server configuration, falling back to safe defaults.
 ///
 /// Not Linux-only: every function it calls is platform-independent, and the
@@ -90,11 +82,9 @@ pub fn parse_period(s: &str) -> agentsight::TimePeriod {
 /// Calculate nanosecond timestamp for N hours ago
 #[cfg(target_os = "linux")]
 pub fn hours_ago_ns(hours: u64) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    // A pre-epoch realtime clock degrades to 0 (the `epoch_nanos` family
+    // contract) instead of unwrapping the elapsed-time error.
+    let now = agentsight::utils::epoch_nanos(std::time::SystemTime::now());
     // Saturate so an absurd --last (up to u64::MAX) degrades to "everything"
     // (a zero start) instead of overflowing: the nanosecond product leaves u64
     // above ~5.12 million hours, and a debug build aborts on the multiply.

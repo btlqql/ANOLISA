@@ -28,23 +28,45 @@ def json_lines(path: Path) -> Iterable[dict[str, Any]]:
                 yield item
 
 
+def _coerce_optional_status(status: Any) -> int | None:
+    """Coerce an optional k6 ``data.status`` value to an integer code.
+
+    The status field is optional load-generator metadata: a list, object,
+    non-numeric string or non-finite number contributes no success evidence
+    instead of aborting the read of the remaining records.
+    """
+    try:
+        return int(status)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def load_expected(path: Path) -> tuple[set[str], set[str]]:
     """Return request IDs from legacy k6 output containing per-request tags."""
     expected: set[str] = set()
     successful: set[str] = set()
     for item in json_lines(path):
-        tags = item.get("data", {}).get("tags", {})
+        # `data` and its `tags` are optional load-generator metadata whose shape
+        # is not guaranteed. A list, string or null used to raise
+        # AttributeError from `.get` and abort the read, losing every later
+        # record (and the whole comparison); a non-dict value contributes no
+        # evidence instead.
+        data = item.get("data")
+        data = data if isinstance(data, dict) else {}
+        tags = data.get("tags")
+        tags = tags if isinstance(tags, dict) else {}
         request_id = item.get("request_id") or tags.get("request_id")
         if not request_id:
             continue
         request_id = str(request_id)
         expected.add(request_id)
         metric = item.get("metric")
-        value = item.get("data", {}).get("value")
-        status = item.get("data", {}).get("status")
+        value = data.get("value")
+        status = data.get("status")
         if metric == "benchmark_http_success" and value:
             successful.add(request_id)
-        if status is not None and 200 <= int(status) < 300:
+        status_code = _coerce_optional_status(status)
+        if status_code is not None and 200 <= status_code < 300:
             successful.add(request_id)
     return expected, successful
 

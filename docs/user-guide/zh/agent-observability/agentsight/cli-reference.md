@@ -422,3 +422,9 @@ Dashboard 的 Skill 指标页展示的是同一批数字。
 - [配置](configuration.md)——配置文件控制哪些行为
 - [Dashboard 指南](dashboard.md)——这些查询在界面上的等价操作
 - [数据与存储](data-and-storage.md)——HTTP API 与数据库结构
+
+## 基准测试产物
+
+运行 `scripts/benchmark/campaign/aggregate_report.py --campaign <campaign.json> --results <results>` 时还会导出 UTF-8 `run-inventory.csv`。清单包含 `runs/**/run-result.json` 下发现的 smoke、capacity、matrix、soak、recovery 和 fault 正式运行，按相对证据路径排序。列包含运行参数、harness 退出码、结论、缺失及失败门槛的 JSON 数组和 `result_path`；未提供的可选值留空。归档的不完整运行不在此清单内。既有汇总报告和原始证据保持不变。
+
+资源报告可通过 `render_report.py --metrics <file.csv.gz>` 读取普通 CSV 或 gzip CSV。Campaign 恢复证据优先使用 `measurement/metrics.csv`，仅在普通文件缺失时使用 `measurement/metrics.csv.gz`。压缩文件沿用相同列和计算方式；损坏的压缩输入仍会报错。

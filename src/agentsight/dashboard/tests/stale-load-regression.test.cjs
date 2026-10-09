@@ -166,6 +166,43 @@ test('conversation-list: query and agent-name loaders drop stale responses', () 
     ],
     'ConversationList.loadAgentNames',
   );
+
+  // The trace sub-table re-fetches whenever the expanded session or the time
+  // range changes. Its render branch keys on `error`, so a transient failure
+  // used to pin the error panel even after a later fetch returned rows, and an
+  // older response could land after a newer one.
+  assert.match(
+    source,
+    /setError\(null\);[\s\S]{0,400}fetchTraces\(sessionId, startNs, endNs\)/,
+    'ConversationList.TraceSubTable: the previous failure must be cleared before the next fetch',
+  );
+  assert.match(
+    source,
+    /fetchTraces\(sessionId, startNs, endNs\)[\s\S]{0,400}if \(!cancelled\) setTraces\(rows\);/,
+    'ConversationList.TraceSubTable: the trace write must be gated on the effect cleanup flag',
+  );
+  assert.match(
+    source,
+    /fetchTraces\(sessionId, startNs, endNs\)[\s\S]{0,600}if \(!cancelled\) setLoading\(false\);/,
+    'ConversationList.TraceSubTable: the loading flag must belong to the newest request',
+  );
+
+  // The agent filter matches the dropdown option against the row's label. The
+  // option list comes from `/api/agent-names`, whose SQL groups by
+  // `agent_name COLLATE NOCASE`, while the session rows render
+  // `COALESCE(agent_name, process_name)` — so the same agent can appear as
+  // `Qoder` in one and `qoder` in the other, exactly the split
+  // AgentSessionsPage documents. An exact `===` comparison then emptied the
+  // table for the only option the dropdown offered.
+  assert.match(
+    source,
+    /data\.filter\(\(s\) => \(s\.agent_name \?\? ''\)\.toLowerCase\(\) === agent\.toLowerCase\(\)\)/,
+    'ConversationList.runQuery: the agent filter must compare case-insensitively',
+  );
+  assert.ok(
+    !/data\.filter\(\(s\) => s\.agent_name === agent\)/.test(source),
+    'ConversationList.runQuery: the exact-match agent filter must be gone',
+  );
 });
 
 test('atif-viewer: the document loader drops stale responses', () => {
@@ -186,5 +223,71 @@ test('atif-viewer: the document loader drops stale responses', () => {
     source,
     /if \(requestId === loadRequestIdRef\.current\) setSavingsDetail\(detail\);/,
     'AtifViewerPage: the savings write must be gated on the load request id',
+  );
+
+  // Local FileReader imports share the load identity: taking the id before
+  // the read invalidates in-flight network loads, and both reader
+  // completions are gated so an invalidated read cannot replace the
+  // document, surface an obsolete error or finish another load's state.
+  const importStart = source.indexOf('const handleFileImport = useCallback(');
+  assert.ok(importStart >= 0, 'AtifViewerPage.handleFileImport must exist');
+  const importBody = source.slice(importStart, source.indexOf('}, [t]);', importStart));
+  const takesId = importBody.indexOf('const requestId = ++loadRequestIdRef.current;');
+  const startsRead = importBody.indexOf('reader.readAsText(file);');
+  assert.ok(
+    takesId >= 0 && takesId < startsRead,
+    'AtifViewerPage.handleFileImport: the import must take the load id before reading',
+  );
+  const gatedCompletions = importBody.match(/requestId !== loadRequestIdRef\.current\) return;/g) ?? [];
+  assert.equal(gatedCompletions.length, 2,
+    'AtifViewerPage.handleFileImport: onload and onerror must both be gated');
+  assert.match(
+    importBody,
+    /onerror[\s\S]{0,200}setLoading\(false\);/,
+    'AtifViewerPage.handleFileImport: a terminal read failure must release loading',
+  );
+});
+
+test('optimization: a dimension result must not land in another session', () => {
+  const source = readSource('src/pages/OptimizationPage.tsx');
+  assert.match(source, /const activeSessionRef = useRef\(sessionId\);/);
+
+  const run = source.indexOf('const runDimensions = useCallback(');
+  assert.ok(run >= 0, 'runDimensions must exist');
+  const body = source.slice(run, source.indexOf('[sessionId, handleDimError, t],', run));
+  // Every dimension write and failure handler must consult the guard: the
+  // requests run for tens of seconds while the route param can change.
+  assert.match(
+    body,
+    /if \(isCurrent\(\)\) apply\(data\);/,
+    'OptimizationPage: dimension results must be gated on the active session',
+  );
+  assert.match(
+    body,
+    /if \(!isCurrent\(\)\) return;\s*handleDimError\(e\);/,
+    'OptimizationPage: dimension failures must be gated on the active session',
+  );
+  const guarded = body.match(/forSession<[A-Za-z]+>\(/g) ?? [];
+  assert.equal(guarded.length, 6, 'all six dimensions must use the gated setter');
+});
+
+test('system-audit: load-more must not append a page from a superseded list', () => {
+  const source = readSource('src/pages/SystemAuditPage.tsx');
+  const loadMore = source.indexOf('const loadMoreEvents = async () => {');
+  assert.ok(loadMore >= 0, 'the load-more handler must exist');
+  const body = source.slice(loadMore, source.indexOf('\n  };', loadMore));
+
+  const versionTaken = body.indexOf('const version = loadRequestVersion.current;');
+  const fetchAt = body.indexOf('await fetchAuditEvents(');
+  const check = body.indexOf('if (loadRequestVersion.current !== version) return;');
+  const append = body.indexOf('setEvents((prev) => [...prev, ...result.data.items]);');
+
+  assert.ok(
+    versionTaken >= 0 && versionTaken < fetchAt,
+    'SystemAuditPage.loadMoreEvents: the page must be bound to the current list version',
+  );
+  assert.ok(
+    check > fetchAt && check < append,
+    'SystemAuditPage.loadMoreEvents: the version must be re-checked between the await and the append',
   );
 });

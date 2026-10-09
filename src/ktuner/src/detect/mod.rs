@@ -48,7 +48,6 @@ pub struct SysctlValues {
     pub dirty_ratio: u64,
     pub dirty_background_ratio: u64,
     pub somaxconn: u64,
-    pub tcp_fastopen: u64,
     pub thp_enabled: String,
 }
 
@@ -90,10 +89,37 @@ impl std::fmt::Display for RuntimeEnv {
 }
 
 pub fn detect_runtime_env() -> RuntimeEnv {
-    if Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists() {
+    runtime_env_from(Path::new("/"))
+}
+
+/// Classify the runtime from the filesystem rooted at `root` (`/` in
+/// production; a temp dir in tests).
+fn runtime_env_from(root: &Path) -> RuntimeEnv {
+    if root.join(".dockerenv").exists() || root.join("run/.containerenv").exists() {
         return RuntimeEnv::Container;
     }
-    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+    // systemd's container interface: when systemd runs as PID 1 inside a
+    // container it records the manager's name here, taken from the
+    // `container=` variable the manager puts in its environment. In a cgroup
+    // v2 container this is the only signal that is left — /proc/1/cgroup is
+    // then the namespace root `0::/` and PID 1 is a known init, so both checks
+    // below report a bare host.
+    //
+    // `wsl` is the one value that is not a container here: WSL2's own init
+    // exports it (systemd documents WSL as "categorized as a container for
+    // practical purposes"), but /proc/sys in WSL2 is the WSL kernel the
+    // workload itself runs on — not a host kernel shared with other machines —
+    // so the bare-host verdict the scope already gets must not change.
+    if let Some(manager) = read_text_lossy(&root.join("run/systemd/container")) {
+        let manager = manager.trim();
+        if !manager.is_empty() && manager != "wsl" {
+            return RuntimeEnv::Container;
+        }
+    }
+    // Both files are read lossily: cgroup paths and PID 1's comm (the first
+    // token of /proc/1/sched) may hold non-UTF-8 bytes, which made
+    // `read_to_string` skip the check and report a container as `BareHost`.
+    if let Some(cgroup) = read_text_lossy(&root.join("proc/1/cgroup")) {
         if cgroup.contains("docker")
             || cgroup.contains("kubepods")
             || cgroup.contains("containerd")
@@ -107,7 +133,16 @@ pub fn detect_runtime_env() -> RuntimeEnv {
     // OpenRC, ...), so whitelist those to avoid misclassifying them as
     // containers (which would wrongly mark params read-only and steer the user
     // to the host-export workflow).
-    if let Ok(sched) = fs::read_to_string("/proc/1/sched") {
+    //
+    // `dumb-init` is deliberately absent: it is "designed to run as PID 1
+    // inside minimal container environments" (its own README), and outside
+    // containers it is a child of a supervisor rather than PID 1, so its name
+    // at PID 1 identifies a container — the same shim class as `tini`, which
+    // this list has never included. It was the remaining case of a cgroup-v2
+    // container (whose /proc/1/cgroup is the namespace root `0::/`) still being
+    // reported as a bare host, now that systemd's own containers carry the
+    // /run/systemd/container marker.
+    if let Some(sched) = read_text_lossy(&root.join("proc/1/sched")) {
         const KNOWN_INIT: &[&str] = &[
             "systemd",
             "init",
@@ -118,7 +153,6 @@ pub fn detect_runtime_env() -> RuntimeEnv {
             "upstart",
             "busybox",
             "procd",
-            "dumb-init",
         ];
         let comm = sched.split_whitespace().next().unwrap_or("");
         if !KNOWN_INIT.iter().any(|i| comm.starts_with(i)) {
@@ -126,6 +160,11 @@ pub fn detect_runtime_env() -> RuntimeEnv {
         }
     }
     RuntimeEnv::BareHost
+}
+
+fn read_text_lossy(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn is_param_writable(path: &str) -> bool {
@@ -145,7 +184,40 @@ pub fn is_param_writable(path: &str) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+    // Every ktuner write path runs as root (tune/fix/rollback refuse
+    // otherwise), so `writable` describes the ROOT run, not the invoking
+    // user. An unprivileged `check`/`why`/`tune --dry-run` — all documented
+    // as root-free — used to evaluate access(W_OK) as the caller, so a
+    // non-root preview reported EVERY recommendation unwritable and answered
+    // "blocked" on a host where `sudo ktuner tune` applies them all. For a
+    // non-root caller decide from the facts that bound root instead: the
+    // file's write bits (root owns proc sysctls) and the mount's read-only
+    // flag, which statvfs reports to anyone.
+    if unsafe { libc::geteuid() } == 0 {
+        return unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 };
+    }
+    root_run_can_write(path)
+}
+
+/// Whether ROOT can write `path`, judged without being root: the file grants
+/// a write bit (a proc sysctl is root-owned 0644, so the owner bit covers it;
+/// a write-only 0200 knob also passes) and the mount is not read-only (the
+/// container case, which a root access(W_OK) also reports as unwritable).
+fn root_run_can_write(path: &str) -> bool {
+    let mode = match fs::metadata(path) {
+        Ok(metadata) => std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()),
+        Err(_) => return false,
+    };
+    if mode & 0o222 == 0 {
+        return false;
+    }
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    // f_flag is unsigned long on Linux; ST_RDONLY is the low bit.
+    unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) == 0 && buf.f_flag & libc::ST_RDONLY == 0 }
 }
 
 pub fn gather_system_info() -> Result<SystemInfo> {
@@ -154,7 +226,10 @@ pub fn gather_system_info() -> Result<SystemInfo> {
         kernel_version: read_kernel_version()?,
         os_distro: read_os_distro(),
         cpu_model,
-        cpu_cores,
+        // The same scaling input memory_total_gb already is: inside a cgroup
+        // CPU limit, every cpu-scaled rule would size its recommendation for
+        // processors the workload can never run on.
+        cpu_cores: effective_cpu_cores(cpu_cores, read_cgroup_cpu_limit_cores()),
         numa_nodes: read_numa_nodes(),
         memory_total_gb: read_memory_total_gb()?,
         disks: read_disk_info()?,
@@ -297,17 +372,128 @@ fn effective_memory_gb(host_kb: u64, cgroup_kb: u64) -> u64 {
 }
 
 fn read_cgroup_memory_limit_kb() -> u64 {
-    // cgroup v2
-    if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        return cgroup_v2_limit_kb(&s);
-    }
-    // cgroup v1
-    if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(bytes) = s.trim().parse::<u64>() {
-            return cgroup_v1_limit_kb(bytes);
+    let self_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    cgroup_memory_limit_kb_from(Path::new("/sys/fs/cgroup"), &self_cgroup)
+}
+
+/// The memory limit that binds a process: the smallest real limit from its
+/// own cgroup up to the mount root, 0 when nothing on that chain limits
+/// memory.
+///
+/// The root file alone is not the process's limit. Limits are inherited — a
+/// child cgroup can never exceed its ancestors — so the binding limit is the
+/// minimum over the chain: a systemd unit with `MemoryMax=4G` on a 64 GB
+/// host, or a `--memory 2g` container run with host-shared cgroup
+/// namespaces, keeps its deeper `memory.max` while the root file still reads
+/// `max`. Reading only the root file made `effective_memory_gb` — the one
+/// number every memory-scaled rule consumes — report the host's RAM for a
+/// process that actually gets 4 GB, so dirty-page, watermark and huge-page
+/// sizing all mis-scaled.
+///
+/// `root` is the cgroup filesystem root (`/sys/fs/cgroup`) and
+/// `self_cgroup` the process's `/proc/self/cgroup` content; both are
+/// parameters so the navigation is testable against a synthetic tree.
+fn cgroup_memory_limit_kb_from(root: &Path, self_cgroup: &str) -> u64 {
+    // cgroup v2: the "0::<path>" line. Preferred over v1, mirroring the
+    // root-file order, but only when the chain actually offers memory.max —
+    // a hybrid host delegates the memory controller to v1, so the v2 walk
+    // finds no file at all and must not answer "no limit" from that.
+    if let Some(rel) = cgroup_v2_relative_path(self_cgroup) {
+        if let Some(kb) = chain_limit_kb(root, &rel, "memory.max", cgroup_v2_limit_kb) {
+            return kb;
         }
     }
-    0
+    // cgroup v1: the line of the memory controller, walked under the
+    // controller's own mount (`/sys/fs/cgroup/memory`).
+    if let Some(rel) = cgroup_v1_relative_path(self_cgroup) {
+        if let Some(kb) = chain_limit_kb(
+            &root.join("memory"),
+            &rel,
+            "memory.limit_in_bytes",
+            cgroup_v1_limit_kb_from_content,
+        ) {
+            return kb;
+        }
+    }
+    // No navigable /proc/self/cgroup (unreadable, or a layout the walks
+    // cannot follow): the root files remain the best approximation — the
+    // pre-existing behaviour.
+    if let Some(kb) = chain_limit_kb(root, "/", "memory.max", cgroup_v2_limit_kb) {
+        return kb;
+    }
+    chain_limit_kb(
+        &root.join("memory"),
+        "/",
+        "memory.limit_in_bytes",
+        cgroup_v1_limit_kb_from_content,
+    )
+    .unwrap_or(0)
+}
+
+/// Pure /proc/self/cgroup parsing: the relative cgroup path of the unified
+/// (v2) hierarchy line `0::<path>`, when present.
+fn cgroup_v2_relative_path(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::to_string)
+}
+
+/// Pure /proc/self/cgroup parsing: the relative cgroup path of the v1 line
+/// for the memory controller (`<hierarchy>:<controllers>:<path>`), when
+/// present. The controller list decides, so the v2 line (empty controller
+/// field) and other controllers' lines never match. The line is split into
+/// exactly three fields because the path runs to the end of the line: a
+/// cgroup directory may itself be named with a colon (kernfs only forbids
+/// '/' and '\0' in names), so an unbounded split truncates the membership
+/// at the colon inside the name — the same idiom the CPU membership reader
+/// already uses (`splitn(3, ':')`, cpu_hierarchy).
+fn cgroup_v1_relative_path(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        if !hierarchy.is_empty() && controllers.split(',').any(|c| c == "memory") {
+            Some(path.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Walk the cgroup chain from `rel` up to `root`, reading `file` at every
+/// level; the effective limit is the smallest real limit seen, because a
+/// child can never exceed its ancestors. Levels with no limit (the v2 `max`
+/// sentinel, the v1 unlimited constant, unparsable content) are skipped.
+/// `None` when no level of the chain offers the file at all, so the caller
+/// can fall back to the next hierarchy.
+fn chain_limit_kb(root: &Path, rel: &str, file: &str, parse: fn(&str) -> u64) -> Option<u64> {
+    // Namespace-relative parent components must never walk above this mount
+    // — the same guard cpu_chain_limit carries for the CPU walk.
+    let rel = Path::new(rel.trim_start_matches('/'));
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut dir = root.join(rel);
+    let mut saw_limit_file = false;
+    let mut best: u64 = 0;
+    loop {
+        if let Ok(content) = fs::read_to_string(dir.join(file)) {
+            saw_limit_file = true;
+            let kb = parse(&content);
+            if kb > 0 && (best == 0 || kb < best) {
+                best = kb;
+            }
+        }
+        if dir == root || !dir.pop() {
+            break;
+        }
+    }
+    saw_limit_file.then_some(best)
 }
 
 /// cgroup v2 memory.max content → KB, 0 for the "max" (no-limit) sentinel or
@@ -329,6 +515,147 @@ fn cgroup_v1_limit_kb(bytes: u64) -> u64 {
         bytes / 1024
     } else {
         0
+    }
+}
+
+/// cgroup v1 `memory.limit_in_bytes` content → KB, 0 at/above the 1<<62
+/// "unlimited" sentinel (v1 reports a huge constant rather than "max") — the
+/// content-reading form of [`cgroup_v1_limit_kb`].
+fn cgroup_v1_limit_kb_from_content(raw: &str) -> u64 {
+    raw.trim()
+        .parse::<u64>()
+        .map(cgroup_v1_limit_kb)
+        .unwrap_or(0)
+}
+
+fn read_cgroup_cpu_limit_cores() -> u64 {
+    let self_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    cgroup_cpu_limit_cores_from(Path::new("/sys/fs/cgroup"), &self_cgroup)
+}
+
+// CPU bandwidth is constrained by both the process's cgroup and its ancestors.
+// A readable unlimited v2 chain must not fall through to an unrelated v1 tree;
+// an absent v2 CPU controller on a hybrid hierarchy must allow v1 fallback.
+fn cgroup_cpu_limit_cores_from(root: &Path, self_cgroup: &str) -> u64 {
+    if let Some(rel) = cgroup_v2_relative_path(self_cgroup) {
+        if let Some(cores) = cpu_chain_limit(root, &rel, true) {
+            return cores;
+        }
+    }
+    let cpu_rel = self_cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        fields.next()?;
+        let controllers = fields.next()?;
+        let rel = fields.next()?;
+        controllers.split(',').any(|c| c == "cpu").then_some(rel)
+    });
+    // The common v1 layouts mount cpu alone or together with cpuacct.
+    let v1_roots = [
+        root.join("cpu"),
+        root.join("cpu,cpuacct"),
+        root.join("cpuacct,cpu"),
+    ];
+    if let Some(rel) = cpu_rel {
+        for cpu_root in &v1_roots {
+            if let Some(cores) = cpu_chain_limit(cpu_root, rel, false) {
+                return cores;
+            }
+        }
+    }
+    // Preserve the root approximation when membership cannot be followed.
+    if let Some(cores) = cpu_chain_limit(root, "/", true) {
+        return cores;
+    }
+    v1_roots
+        .iter()
+        .find_map(|r| cpu_chain_limit(r, "/", false))
+        .unwrap_or(0)
+}
+
+fn cpu_chain_limit(root: &Path, rel: &str, v2: bool) -> Option<u64> {
+    // Namespace-relative parent components must never walk above this mount.
+    let rel = Path::new(rel.trim_start_matches('/'));
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut dir = root.join(rel);
+    let mut best = 0;
+    let mut saw_files = false;
+    loop {
+        let cores = if v2 {
+            fs::read_to_string(dir.join("cpu.max"))
+                .ok()
+                .map(|s| cgroup_v2_cpu_max_cores(&s))
+        } else {
+            fs::read_to_string(dir.join("cpu.cfs_quota_us"))
+                .ok()
+                .zip(fs::read_to_string(dir.join("cpu.cfs_period_us")).ok())
+                .map(|(quota, period)| cgroup_v1_cfs_cores(&quota, &period))
+        };
+        if let Some(cores) = cores {
+            saw_files = true;
+            if cores > 0 && (best == 0 || cores < best) {
+                best = cores;
+            }
+        }
+        if dir == root || !dir.pop() {
+            break;
+        }
+    }
+    saw_files.then_some(best)
+}
+
+/// cgroup v2 cpu.max content → whole cores, 0 for the "max" (no-limit)
+/// sentinel or unparseable content. A fractional quota rounds up: a
+/// 150000/100000 limit is one and a half CPUs, and scaling by 1 would
+/// under-size rules relative to what the workload can actually run.
+fn cgroup_v2_cpu_max_cores(raw: &str) -> u64 {
+    let mut fields = raw.split_whitespace();
+    let quota: u64 = match fields.next() {
+        Some(q) if q != "max" => match q.parse() {
+            Ok(quota) => quota,
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    let period: u64 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    cores_from_quota_period(quota, period)
+}
+
+/// cgroup v1 cfs quota/period pair → whole cores, 0 when the quota is the -1
+/// "unlimited" sentinel or either value is unparseable.
+fn cgroup_v1_cfs_cores(quota_raw: &str, period_raw: &str) -> u64 {
+    let quota: i64 = quota_raw.trim().parse().unwrap_or(-1);
+    if quota < 0 {
+        return 0;
+    }
+    let period: u64 = period_raw.trim().parse().unwrap_or(0);
+    cores_from_quota_period(quota as u64, period)
+}
+
+/// Quota per period → whole cores (ceiling), 0 when there is no real limit.
+fn cores_from_quota_period(quota: u64, period: u64) -> u64 {
+    if quota == 0 || period == 0 {
+        return 0;
+    }
+    quota.div_ceil(period)
+}
+
+/// Effective CPU cores: the cgroup limit only when it is a real limit below
+/// the host count; never 0 (a 0 here would mis-scale every cpu-scaled rule,
+/// which is why every cpu-scaled rule consumes this one number). Mirrors
+/// [`effective_memory_gb`]: /proc/cpuinfo counts the host's processors, and a
+/// container with a cpu.max / cfs_quota limit can only run a fraction of
+/// them, so rules scaled by `cpu_cores` sized recommendations for processors
+/// the workload can never run on.
+fn effective_cpu_cores(host_cores: usize, cgroup_cores: u64) -> usize {
+    if cgroup_cores > 0 && (cgroup_cores as usize) < host_cores {
+        cgroup_cores as usize
+    } else {
+        host_cores
     }
 }
 
@@ -465,23 +792,58 @@ fn read_rq_affinity(name: &str) -> u64 {
 }
 
 fn read_network_info() -> Result<Vec<NetInfo>> {
+    read_network_info_from(Path::new("/sys/class/net"))
+}
+
+/// Read every interface under `net_dir` together with its link speed.
+///
+/// The speed lookup is built from the directory entry's raw name, not from
+/// its lossy display form: interface names may contain any byte the kernel's
+/// naming rules allow (`dev_valid_name` accepts everything except `/`, `:`
+/// and whitespace), so a non-UTF-8 name came out of `to_string_lossy` with
+/// U+FFFD replacement bytes and the rebuilt `/sys/class/net/<mangled>/speed`
+/// path no longer resolved — the interface was reported with speed 0.
+/// `net_dir` is a parameter so tests can build a fake sysfs tree.
+fn read_network_info_from(net_dir: &Path) -> Result<Vec<NetInfo>> {
     let mut nets = Vec::new();
-    let net_dir = "/sys/class/net";
 
     if let Ok(entries) = fs::read_dir(net_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
+            // The tun driver creates tun/tap devices and reports a fixed
+            // SPEED_10000 for every one of them — `tun_setup()` seeds the link
+            // ksettings with `tun_default_link_ksettings()` (v6.6
+            // drivers/net/tun.c:2327/3553-3563; master:2408/3640-3650), and the
+            // sysfs `speed` attribute prints that cached default. It is a
+            // driver default, not a negotiated rate: a host with a 1 GbE NIC
+            // and an UP tunnel was judged a 10 GbE host, and every rule gated
+            // on a 10 GbE link then sized its recommendation for a link the
+            // machine does not have.
+            // The name prefixes catch the conventional names, but TUNSETIFF
+            // accepts any device name a caller asks for: `ip tuntap add dev
+            // myvpn0`, OpenVPN with an explicit `dev`, and Tailscale's
+            // `tailscale0` (wireguard-go's tun) all still get the driver's
+            // fixed SPEED_10000. The tun driver exposes its own marker for
+            // exactly this: every device it registers carries a `tun_flags`
+            // sysfs attribute (v6.6 drivers/net/tun.c:2720, `tun_dev_attrs`
+            // in `tun_attr_group`), which no other netdev has. Skip on the
+            // marker so a custom-named tunnel cannot masquerade as the host
+            // link either.
+            let is_tun_device = entry.path().join("tun_flags").exists();
             if name == "lo"
                 || name.starts_with("veth")
                 || name.starts_with("br-")
                 || name.starts_with("virbr")
                 || name == "docker0"
                 || name == "bonding_masters"
+                || name.starts_with("tun")
+                || name.starts_with("tap")
+                || is_tun_device
             {
                 continue;
             }
 
-            let speed_path = format!("/sys/class/net/{name}/speed");
+            let speed_path = entry.path().join("speed");
             let speed_mbps = fs::read_to_string(&speed_path)
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
@@ -504,7 +866,6 @@ fn read_sysctl_values() -> Result<SysctlValues> {
         dirty_ratio: read_sysctl_u64("/proc/sys/vm/dirty_ratio"),
         dirty_background_ratio: read_sysctl_u64("/proc/sys/vm/dirty_background_ratio"),
         somaxconn: read_sysctl_u64("/proc/sys/net/core/somaxconn"),
-        tcp_fastopen: read_sysctl_u64("/proc/sys/net/ipv4/tcp_fastopen"),
         thp_enabled: read_thp_enabled(),
     })
 }
@@ -523,6 +884,16 @@ fn sanitize_speed_mbps(s: i64) -> u64 {
 }
 
 pub(crate) fn read_sysctl_u64(path: &str) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Signed reader for sysctls whose legal range includes -1 (e.g.
+/// kernel.hung_task_warnings, kernel.perf_event_paranoid). The unsigned
+/// reader maps "-1" to 0, which is a different, meaningful value.
+pub(crate) fn read_sysctl_i64(path: &str) -> i64 {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -582,6 +953,13 @@ fn read_processes() -> Result<Vec<ProcessInfo>> {
                     if is_monitoring_helper(&fname) {
                         continue;
                     }
+                    // A client tool names the service it talks to, not the
+                    // service: `clickhouse-client` and `kafka-topics.sh` are
+                    // not a database or a broker, and only the host that runs
+                    // the daemon should get the daemon's rules.
+                    if is_service_tool(&fname) {
+                        continue;
+                    }
                     // For a JVM the name is just "java" (likewise
                     // "python"/"node"/"beam.smp"), so the actual service is
                     // invisible. Recover it from cmdline.
@@ -639,26 +1017,115 @@ pub(crate) fn is_monitoring_helper(pid: &str) -> bool {
 }
 
 /// Whether a command line names a metrics collector. Only the program being
-/// run decides — argv[0], or the payload of a `sh -c` wrapper — because a
-/// bare `exporter` token in a later argument (a config path, say) does not
-/// make the process a collector.
-fn cmdline_names_helper<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
-    let program = args.next().unwrap_or_default();
+/// run decides — argv[0], the payload of a `sh -c` wrapper, or the jar a JVM
+/// runs — because a bare `exporter` token in a later argument (a config
+/// path, say) does not make the process a collector.
+fn cmdline_names_helper<'a>(args: impl Iterator<Item = &'a str>) -> bool {
+    let args: Vec<&str> = args.collect();
+    let Some(&program) = args.first() else {
+        return false;
+    };
     if is_monitoring_helper_name(program) {
         return true;
     }
-    // `sh -c "node_exporter --web.listen-address=..."` runs the collector as
-    // the payload, not as argv[0]; the payload's first word is its command.
-    let is_shell = matches!(
+    if is_shell_program(program) {
+        // `sh -c "node_exporter --web.listen-address=..."` runs the collector as
+        // the payload, not as argv[0]; the payload's first word is its command.
+        return args.get(1) == Some(&"-c")
+            && args
+                .get(2)
+                .and_then(|&payload| payload.split_whitespace().next())
+                .is_some_and(is_monitoring_helper_name);
+    }
+    if program.rsplit('/').next().unwrap_or_default() == "java" {
+        // A JVM names its program in the jar after `-jar`; argv[0] is only the
+        // launcher. `java -jar jmx_prometheus_httpserver-1.2.1.jar 5556
+        // config.yaml` is the Prometheus JMX exporter's documented standalone
+        // form — a collector whose jar carries no "exporter" token, which is
+        // how a metrics-only host kept being detected as a Java workload.
+        return args
+            .iter()
+            .position(|a| *a == "-jar")
+            .and_then(|i| args.get(i + 1))
+            .is_some_and(|&jar| jvm_jar_names_helper(jar));
+    }
+    false
+}
+
+/// Whether `program` (an argv[0]) is a shell that a script file is run under.
+fn is_shell_program(program: &str) -> bool {
+    matches!(
         program.rsplit('/').next().unwrap_or_default(),
         "sh" | "bash" | "dash" | "zsh" | "ksh"
-    );
-    is_shell
-        && args.next() == Some("-c")
-        && args
-            .next()
-            .and_then(|payload| payload.split_whitespace().next())
-            .is_some_and(is_monitoring_helper_name)
+    )
+}
+
+/// ClickHouse's client-side entry points. The vendor's `clickhouse-client`
+/// package ships every one of them as a symlink to the single multi-call
+/// `clickhouse` binary, so the kernel truncates the client's comm to a prefix
+/// the server binary's own name shares (`clickhouse-clie` / `clickhouse-serv`)
+/// and the name alone cannot tell the two apart. The program name can.
+const CLICKHOUSE_CLIENT_TOOLS: &[&str] = &[
+    "clickhouse-benchmark",
+    "clickhouse-client",
+    "clickhouse-compressor",
+    "clickhouse-format",
+    "clickhouse-local",
+    "clickhouse-obfuscator",
+];
+
+/// Whether the program `program` is a *tool* of a service rather than the
+/// service itself.
+///
+/// A service ktuner identifies through its runtime — the JVM/Erlang daemons in
+/// [`RUNTIME_SERVICE_MARKERS`] — is never the process named after it: the
+/// daemon runs as `java` (or the Erlang VM) and is decided from the runtime's
+/// own command line, so an executable called `kafka-topics.sh`, `spark-submit`
+/// or `elasticsearch-keystore` can only be one of its tools. ClickHouse has the
+/// same shape through its multi-call binary. Both share the service's name
+/// prefix with a `-` boundary, which is what `has_process` matches, so a host
+/// that only talks to a service running elsewhere used to get that service's
+/// rules and workload classification.
+fn program_names_service_tool(program: &str) -> bool {
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if CLICKHOUSE_CLIENT_TOOLS.contains(&basename) {
+        return true;
+    }
+    RUNTIME_SERVICE_MARKERS.iter().any(|(_, service)| {
+        basename
+            .strip_prefix(service)
+            .is_some_and(|rest| rest.starts_with('-'))
+    })
+}
+
+/// Whether `pid` runs a service tool instead of the workload.
+///
+/// Like [`is_monitoring_helper`], the program decides: argv[0] for a binary
+/// (a multi-call tool is started under its own name), and — because the kernel
+/// runs a script under its interpreter — the script path in the argument after
+/// argv[0] when that is a shell. `/proc/<pid>/comm` keeps the script's own
+/// name, which is exactly the name that must not satisfy a service match.
+fn is_service_tool(pid: &str) -> bool {
+    let Some(cmdline) = read_cmdline_from(&format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
+    let Some(program) = args.next() else {
+        return false;
+    };
+    if program_names_service_tool(program) {
+        return true;
+    }
+    is_shell_program(program) && args.next().is_some_and(program_names_service_tool)
+}
+
+/// Whether the jar a JVM runs names a metrics collector. The Prometheus JMX
+/// exporter's standalone jars are `jmx_prometheus_httpserver-<v>.jar` (the
+/// name carries no "exporter" token), while other JVM collectors carry it
+/// (`cassandra_exporter-<v>.jar`).
+fn jvm_jar_names_helper(jar: &str) -> bool {
+    let basename = jar.rsplit('/').next().unwrap_or(jar);
+    is_monitoring_helper_name(basename) || basename.starts_with("jmx_prometheus")
 }
 
 fn is_generic_runtime(comm: &str) -> bool {
@@ -682,6 +1149,11 @@ const RUNTIME_SERVICE_MARKERS: &[(&str, &str)] = &[
     ("elasticsearch", "elasticsearch"),
     ("org.opensearch", "opensearch"),
     ("opensearch", "opensearch"),
+    // Kafka's daemon main classes all live under the connect package (the
+    // Connect workers and MirrorMaker 2); the bare org.apache.kafka root is
+    // deliberately NOT mapped — clients and tools (org.apache.kafka.clients,
+    // .tools) are consumers of the service, not the service itself.
+    ("org.apache.kafka.connect", "kafka"),
     ("kafka.kafka", "kafka"),
     ("kafka", "kafka"),
     ("org.apache.zookeeper", "zookeeper"),
@@ -695,9 +1167,12 @@ const RUNTIME_SERVICE_MARKERS: &[(&str, &str)] = &[
     ("org.apache.hadoop", "hadoop"),
     ("hadoop", "hadoop"),
     ("hbase", "hbase"),
+    ("org.apache.solr", "solr"),
     ("solr", "solr"),
     ("logstash", "logstash"),
+    ("org.apache.pulsar", "pulsar"),
     ("pulsar", "pulsar"),
+    ("org.apache.catalina", "tomcat"),
     ("catalina", "tomcat"),
     ("tomcat", "tomcat"),
     ("jenkins", "jenkins"),
@@ -744,23 +1219,71 @@ fn runtime_service_from_cmdline(cmdline: &str) -> Option<&'static str> {
         .iter()
         .map(|(marker, _)| name_tokens(marker))
         .collect();
-    let names: Vec<Vec<String>> = candidates
+    let names: Vec<CandidateName> = candidates
         .iter()
         .map(|c| {
             let basename = c.rsplit('/').next().unwrap_or(c);
-            name_tokens(basename)
+            CandidateName {
+                // The class name is the last dotted component: a main class is
+                // the program, its package only says where the program lives.
+                class_tokens: name_tokens(basename.rsplit('.').next().unwrap_or(basename)),
+                tokens: name_tokens(basename),
+                is_class: is_class_name(basename),
+            }
         })
         .collect();
 
     for ((_, svc), needle) in RUNTIME_SERVICE_MARKERS.iter().zip(marker_tokens.iter()) {
-        if names
-            .iter()
-            .any(|tokens| token_run_contains(tokens, needle))
-        {
+        if names.iter().any(|name| name.matches(needle)) {
             return Some(svc);
         }
     }
     None
+}
+
+/// One candidate argument, tokenized for marker matching.
+struct CandidateName {
+    /// Tokens of the whole (basename) argument.
+    tokens: Vec<String>,
+    /// Tokens of its last dotted component, i.e. the class name.
+    class_tokens: Vec<String>,
+    /// Whether the argument is a dotted identifier chain rather than a file.
+    is_class: bool,
+}
+
+impl CandidateName {
+    /// Whether `needle` identifies this candidate.
+    ///
+    /// A file name (`kafka_2.13-3.7.0.jar`, `sparklesh-report.py`) is matched
+    /// anywhere in its tokens, as before. A class is decided by its own name or
+    /// by a package run it owns from the root: `kafka.Kafka` and
+    /// `org.apache.zookeeper.server.quorum.QuorumPeerMain` are the services,
+    /// while `com.example.kafka.ConsumerApp` merely lives under a package that
+    /// mentions kafka and is a client of it, not a broker.
+    fn matches(&self, needle: &[String]) -> bool {
+        if !self.is_class {
+            return token_run_contains(&self.tokens, needle);
+        }
+        token_run_starts_at(&self.tokens, needle) || token_run_contains(&self.class_tokens, needle)
+    }
+}
+
+/// Whether an argument reads as a Java class (`com.example.Main`) rather than
+/// a file name: every dot-separated component is an identifier.
+fn is_class_name(candidate: &str) -> bool {
+    candidate.contains('.')
+        && candidate.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
+/// Whether `haystack` begins with `needle` as a run of tokens.
+fn token_run_starts_at(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty() && haystack.len() >= needle.len() && haystack[..needle.len()] == *needle
 }
 
 /// Split a name into its runs of ASCII alphanumeric characters (lowercased).
@@ -859,7 +1382,6 @@ mod tests {
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
                 somaxconn: 128,
-                tcp_fastopen: 0,
                 thp_enabled: "always".to_string(),
             },
             processes: names
@@ -982,6 +1504,267 @@ mod tests {
     }
 
     #[test]
+    fn effective_cpu_cores_clamps_to_the_cgroup_limit() {
+        // A 2-CPU quota on a 128-core host scales by 2, not 128.
+        assert_eq!(effective_cpu_cores(128, 2), 2);
+        // A single-core quota never floors to 0 — every cpu-scaled rule
+        // consumes this number, and a 0 would mis-scale all of them.
+        assert_eq!(effective_cpu_cores(128, 1), 1);
+        // No limit (0) and a limit at/above the host count keep the host.
+        assert_eq!(effective_cpu_cores(8, 0), 8);
+        assert_eq!(effective_cpu_cores(2, 64), 2);
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_max_handles_max_sentinel_and_ceil() {
+        // "max" is the no-limit sentinel, not a value.
+        assert_eq!(cgroup_v2_cpu_max_cores("max 100000\n"), 0);
+        // 200000 per 100000 period is exactly 2 CPUs.
+        assert_eq!(cgroup_v2_cpu_max_cores("200000 100000\n"), 2);
+        // 150000 per 100000 is one and a half CPUs, rounded up to 2.
+        assert_eq!(cgroup_v2_cpu_max_cores("150000 100000\n"), 2);
+        // A missing period is not a parseable limit.
+        assert_eq!(cgroup_v2_cpu_max_cores("200000\n"), 0);
+        assert_eq!(cgroup_v2_cpu_max_cores("garbage"), 0);
+        assert_eq!(cgroup_v2_cpu_max_cores(""), 0);
+    }
+
+    #[test]
+    fn cgroup_v1_cfs_cores_rejects_unlimited_sentinel() {
+        // -1 is v1's no-limit sentinel for the quota.
+        assert_eq!(cgroup_v1_cfs_cores("-1\n", "100000\n"), 0);
+        // A real 200000/100000 quota converts to 2 cores.
+        assert_eq!(cgroup_v1_cfs_cores("200000\n", "100000\n"), 2);
+        // Garbage on either side is not a limit.
+        assert_eq!(cgroup_v1_cfs_cores("garbage", "100000\n"), 0);
+        assert_eq!(cgroup_v1_cfs_cores("200000\n", "garbage"), 0);
+    }
+
+    #[test]
+    fn cgroup_v2_relative_path_reads_the_unified_line() {
+        // The v2 line may sit among v1 lines; the path after "0::" is the
+        // process's own cgroup, relative to the mount root.
+        assert_eq!(
+            cgroup_v2_relative_path("11:blkio:/init.scope\n0::/system.slice/ktuner.service\n")
+                .as_deref(),
+            Some("/system.slice/ktuner.service")
+        );
+        // A container with a private cgroup namespace sits at the root.
+        assert_eq!(cgroup_v2_relative_path("0::/\n").as_deref(), Some("/"));
+        // No unified line -> None.
+        assert_eq!(cgroup_v2_relative_path("11:memory:/init.scope\n"), None);
+        assert_eq!(cgroup_v2_relative_path(""), None);
+    }
+
+    #[test]
+    fn cgroup_v1_relative_path_reads_the_memory_controller_line() {
+        let content =
+            "10:cpu,cpuacct:/user.slice\n11:memory:/system.slice/db.service\n0::/init.scope\n";
+        assert_eq!(
+            cgroup_v1_relative_path(content).as_deref(),
+            Some("/system.slice/db.service")
+        );
+        // The controller list decides: other controllers' lines and the v2
+        // line (empty controller field) are not the memory line.
+        assert_eq!(
+            cgroup_v1_relative_path("10:cpu,cpuacct:/user.slice\n"),
+            None
+        );
+        assert_eq!(cgroup_v1_relative_path("0::/init.scope\n"), None);
+        assert_eq!(cgroup_v1_relative_path(""), None);
+    }
+
+    /// A synthetic cgroup filesystem: one `memory.max` per relative path.
+    fn cgroup_tree(entries: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_cgroup_tree_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for (rel, content) in entries {
+            let dir = root.join(rel.trim_start_matches('/'));
+            fs::create_dir_all(&dir).expect("create cgroup dir");
+            fs::write(dir.join("memory.max"), content).expect("write memory.max");
+        }
+        root
+    }
+
+    #[test]
+    fn cgroup_limit_honours_a_nested_limit() {
+        // A systemd unit with MemoryMax=4G on a host whose root and slice
+        // set no limit: the root file reads "max", and only the unit's own
+        // cgroup names the 4 GB that actually binds the process.
+        let root = cgroup_tree(&[
+            ("", "max\n"),
+            ("system.slice", "max\n"),
+            ("system.slice/ktuner.service", "4294967296\n"),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "0::/system.slice/ktuner.service\n"),
+            4 * 1024 * 1024,
+            "the unit's own 4 GB limit must bind, not the root's max"
+        );
+        // A container with a private cgroup namespace sits at the root and
+        // keeps seeing exactly the root's value (no limit here).
+        assert_eq!(cgroup_memory_limit_kb_from(&root, "0::/\n"), 0);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cgroup_limit_takes_the_smallest_ancestor_limit() {
+        // Limits inherit: an ancestor capped at 2 GB binds a child capped at
+        // 4 GB, and a pod's 4 GB sandbox binds deeper cgroups.
+        let root = cgroup_tree(&[
+            ("", "max\n"),
+            ("system.slice", "2147483648\n"),
+            ("system.slice/app.service", "4294967296\n"),
+            ("kubepods", "8589934592\n"),
+            ("kubepods/pod123", "4294967296\n"),
+            ("kubepods/pod123/abc", "max\n"),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "0::/system.slice/app.service\n"),
+            2 * 1024 * 1024
+        );
+        // Deeper than the sandbox limit, with no own limit: the walk stops at
+        // the first real limit on the way up.
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "0::/kubepods/pod123/abc\n"),
+            4 * 1024 * 1024
+        );
+        // A cgroup path deeper than anything in the tree still walks up.
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "0::/system.slice/app.service/child\n"),
+            2 * 1024 * 1024
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cgroup_limit_falls_back_to_v1_and_then_root_files() {
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_cgroup_v1_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        // Pure v1 layout: the memory controller is mounted at root/memory
+        // and there is no unified-hierarchy memory.max anywhere.
+        let v1_leaf = root.join("memory/system.slice/db.service");
+        fs::create_dir_all(&v1_leaf).expect("create v1 cgroup dir");
+        fs::write(v1_leaf.join("memory.limit_in_bytes"), b"2147483648\n").expect("write limit");
+        fs::write(
+            root.join("memory/memory.limit_in_bytes"),
+            b"9223372036854775807\n", // v1's unlimited sentinel at the root
+        )
+        .expect("write root limit");
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "11:memory:/system.slice/db.service\n"),
+            2 * 1024 * 1024,
+            "the v1 memory line must navigate to its own cgroup's limit"
+        );
+
+        // No /proc/self/cgroup information at all: the root files decide,
+        // exactly as before the chain walk existed.
+        fs::write(root.join("memory.max"), b"4294967296\n").expect("write v2 root limit");
+        assert_eq!(cgroup_memory_limit_kb_from(&root, ""), 4 * 1024 * 1024);
+
+        // Nothing readable anywhere -> 0 (no limit known).
+        let empty = cgroup_tree(&[]);
+        assert_eq!(cgroup_memory_limit_kb_from(&empty, "0::/deep/chain\n"), 0);
+        assert_eq!(cgroup_memory_limit_kb_from(&empty, ""), 0);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn cgroup_v1_relative_path_keeps_colons_in_the_path() {
+        // A cgroup directory may itself be named with a colon (kernfs only
+        // forbids '/' and '\0'), and the membership line's path field runs
+        // to the end of the line. An unbounded split truncated the path at
+        // the first colon inside the name, so the walk navigated to an
+        // unrelated directory.
+        assert_eq!(
+            cgroup_v1_relative_path("11:memory:/lxc:web/db\n").as_deref(),
+            Some("/lxc:web/db")
+        );
+        // Multiple colons in the name survive whole as well.
+        assert_eq!(
+            cgroup_v1_relative_path("11:memory:/a:b:c\n").as_deref(),
+            Some("/a:b:c")
+        );
+        // The controller list still decides, colons notwithstanding.
+        assert_eq!(cgroup_v1_relative_path("10:cpu,cpuacct:/lxc:web\n"), None);
+    }
+
+    #[test]
+    fn cgroup_limit_follows_a_colon_named_v1_cgroup() {
+        // The truncated membership walked the wrong chain: a cgroup named
+        // "lxc:web" holding a real 2 GB limit read as its colon-free prefix
+        // "lxc" (an unrelated sibling with an 8 GB limit), so every
+        // memory-scaled rule sized for a host that gets a quarter of what
+        // the process actually has.
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_cgroup_colon_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let leaf = root.join("memory/lxc:web");
+        fs::create_dir_all(&leaf).expect("create colon-named cgroup");
+        fs::write(leaf.join("memory.limit_in_bytes"), b"2147483648\n").expect("write leaf limit");
+        let sibling = root.join("memory/lxc");
+        fs::create_dir_all(&sibling).expect("create colon-prefix sibling");
+        fs::write(sibling.join("memory.limit_in_bytes"), b"8589934592\n").expect("write sibling");
+        fs::write(
+            root.join("memory/memory.limit_in_bytes"),
+            b"9223372036854775807\n", // v1's unlimited sentinel at the root
+        )
+        .expect("write root limit");
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "11:memory:/lxc:web\n"),
+            2 * 1024 * 1024,
+            "the colon-named cgroup's own 2 GB limit must bind"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn chain_limit_kb_refuses_to_walk_above_the_mount() {
+        // Parity with cpu_chain_limit: a membership line whose path carries
+        // a parent component must not let the walk read limit files outside
+        // the mount root it was given.
+        let base = std::env::temp_dir().join(format!(
+            "ktuner_chain_guard_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        fs::create_dir_all(&root).expect("create mount root");
+        fs::write(root.join("memory.max"), b"max\n").expect("write root limit");
+        let outside = base.join("escape");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(outside.join("memory.max"), b"4294967296\n").expect("write outside limit");
+
+        assert_eq!(
+            chain_limit_kb(&root, "/../escape", "memory.max", cgroup_v2_limit_kb),
+            None,
+            "a parent component must not escape the mount"
+        );
+        // End to end: the v2 walk refuses, no v1 line exists, and the root
+        // approximation answers from the mount root itself.
+        assert_eq!(
+            cgroup_memory_limit_kb_from(&root, "0::/../escape\n"),
+            0,
+            "the escapee file outside the mount must not become the limit"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn active_option_finds_bracketed_token_anywhere() {
         // The active option is the bracketed token, wherever it appears.
         assert_eq!(
@@ -1073,6 +1856,246 @@ mod tests {
     }
 
     #[test]
+    fn root_run_can_write_follows_the_mode_bits() {
+        // The unprivileged branch's judgement is caller-independent: a file
+        // with a write bit on a read-write mount is writable by root (proc
+        // sysctls are root-owned 0644, write-only knobs 0200), a file with
+        // no write bit is not, and a missing file never is.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_root_write_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        for (name, mode) in [
+            ("writable", 0o644),
+            ("write_only", 0o200),
+            ("sealed", 0o444),
+        ] {
+            let file = dir.join(name);
+            fs::write(&file, b"0").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        assert!(root_run_can_write(dir.join("writable").to_str().unwrap()));
+        assert!(root_run_can_write(dir.join("write_only").to_str().unwrap()));
+        assert!(!root_run_can_write(dir.join("sealed").to_str().unwrap()));
+        assert!(!root_run_can_write(dir.join("missing").to_str().unwrap()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `writable` describes the root run, not the invoking user: every write
+    /// path requires root, so an unprivileged `check` / `why` /
+    /// `tune --dry-run` (all documented root-free) must not report a
+    /// root-owned writable knob as unwritable — the preview would answer
+    /// "blocked" on a host where `sudo ktuner tune` applies everything.
+    /// The parent (root) prepares root-owned fixtures; the assertions run in
+    /// an unprivileged child so the caller-relative access(W_OK) is what
+    /// breaks, not the fixtures.
+    #[test]
+    #[ignore = "requires root to prepare root-owned fixtures; only fixture files are written"]
+    fn writability_describes_the_root_run_for_an_unprivileged_caller() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "KTUNER_WRITABILITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert_eq!(unsafe { libc::geteuid() }, 0, "requires root");
+            let dir = std::env::temp_dir().join(format!(
+                "ktuner_writable_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(&dir).unwrap();
+            for (name, mode) in [("writable", 0o644), ("sealed", 0o444)] {
+                let file = dir.join(name);
+                fs::write(&file, b"0").unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let output = std::process::Command::new("setpriv")
+                .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "detect::tests::writability_describes_the_root_run_for_an_unprivileged_caller",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("KTUNER_WRITABILITY_DIR", &dir)
+                .output()
+                .unwrap();
+            fs::remove_dir_all(&dir).ok();
+            assert!(
+                output.status.success(),
+                "unprivileged child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("KTUNER_WRITABILITY_DIR").expect("fixture dir"),
+        );
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            65534,
+            "child must run unprivileged"
+        );
+        // A root-owned 0644 knob (the shape of every proc sysctl): the value
+        // an unprivileged caller sees must match what the root run can do.
+        assert!(
+            is_param_writable(dir.join("writable").to_str().unwrap()),
+            "the preview describes the root run, not the invoking user"
+        );
+        // No write bit at all: unwritable for the root run too.
+        assert!(!is_param_writable(dir.join("sealed").to_str().unwrap()));
+    }
+
+    #[test]
+    fn read_sysctl_i64_parses_negative_values() {
+        // "-1" is how the kernel encodes "unlimited" for several sysctls; the
+        // unsigned reader maps it to 0 (a different, meaningful value).
+        let path = std::env::temp_dir().join(format!(
+            "ktuner_read_sysctl_i64_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"-1\n").unwrap();
+        assert_eq!(read_sysctl_i64(path.to_str().unwrap()), -1);
+        std::fs::write(&path, b"2\n").unwrap();
+        assert_eq!(read_sysctl_i64(path.to_str().unwrap()), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The kernel's `dev_valid_name` accepts any interface name without `/`,
+    /// `:` or whitespace, so a name can be non-UTF-8. The speed lookup must be
+    /// built from the directory entry's raw name: rebuilding the path from the
+    /// lossy display form (`to_string_lossy` → U+FFFD) made the `speed` file
+    /// unresolvable and reported the interface as having no known speed.
+    #[test]
+    fn network_info_reads_speed_for_a_non_utf8_interface_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // One interface whose name carries a raw 0xFF byte, one ordinary
+        // interface, and the loopback shorthand that must stay skipped.
+        let raw = dir.join(std::ffi::OsStr::from_bytes(b"eth\xff0"));
+        fs::create_dir_all(&raw).expect("create fake interface dir");
+        fs::write(raw.join("speed"), b"10000\n").expect("write speed");
+        let plain = dir.join("ens5");
+        fs::create_dir_all(&plain).expect("create plain interface dir");
+        fs::write(plain.join("speed"), b"1000\n").expect("write speed");
+        let lo = dir.join("lo");
+        fs::create_dir_all(&lo).expect("create loopback dir");
+        fs::write(lo.join("speed"), b"1000\n").expect("write speed");
+
+        let nets = read_network_info_from(&dir).expect("read fake sysfs tree");
+        assert_eq!(nets.len(), 2, "lo is skipped: {nets:?}");
+
+        let non_utf8 = nets
+            .iter()
+            .find(|n| n.speed_mbps == 10000)
+            .expect("the non-UTF-8 interface must report its speed");
+        // The stored display name is lossy, but the lookup used the raw name.
+        assert_eq!(non_utf8.name, "eth\u{fffd}0");
+        assert_eq!(
+            nets.iter().find(|n| n.name == "ens5").unwrap().speed_mbps,
+            1000
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tun driver reports a fixed SPEED_10000 for every device it creates
+    /// (`tun_setup()` seeds the link ksettings with `tun_default_link_ksettings()`
+    /// and `speed_show()` prints that default), so an UP tunnel is not evidence
+    /// of a 10 GbE host link. A 1 GbE host running OpenVPN's default `tun0`
+    /// used to be judged 10 GbE and got the 万兆 recommendations.
+    #[test]
+    fn network_info_ignores_the_tun_drivers_fixed_speed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_tunnel_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // A 1 GbE NIC next to the tunnel devices the tun driver creates.
+        for (name, speed) in [("eth0", "1000\n"), ("tun0", "10000\n"), ("tap0", "10000\n")] {
+            let iface = dir.join(name);
+            fs::create_dir_all(&iface).expect("create fake interface dir");
+            fs::write(iface.join("speed"), speed).expect("write speed");
+        }
+
+        let mut info = info_with_processes(&[]);
+        info.network = read_network_info_from(&dir).expect("read fake sysfs tree");
+        assert_eq!(
+            info.max_net_speed(),
+            1000,
+            "a tunnel's fixed 10 Gb/s default must not decide the host link speed: {:?}",
+            info.network
+                .iter()
+                .map(|n| (n.name.as_str(), n.speed_mbps))
+                .collect::<Vec<_>>()
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tun/tap device can be created with any name (TUNSETIFF takes the
+    /// caller's), and every device the tun driver registers still reports the
+    /// fixed SPEED_10000 - Tailscale's `tailscale0` and an explicitly named
+    /// OpenVPN `myvpn0` are the shapes the name prefixes miss. But the driver
+    /// marks its own devices: each one carries a `tun_flags` sysfs attribute
+    /// (v6.6 drivers/net/tun.c:2720), which no other netdev has, so the
+    /// marker must close the hole the prefixes leave.
+    #[test]
+    fn network_info_ignores_a_custom_named_tun_device() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_custom_tun_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // A 1 GbE NIC next to custom-named tunnels (no tun/tap prefix), each
+        // carrying the tun driver's own marker attribute.
+        for (name, speed, is_tun) in [
+            ("eth0", "1000\n", false),
+            ("tailscale0", "10000\n", true),
+            ("myvpn0", "10000\n", true),
+        ] {
+            let iface = dir.join(name);
+            fs::create_dir_all(&iface).expect("create fake interface dir");
+            fs::write(iface.join("speed"), speed).expect("write speed");
+            if is_tun {
+                fs::write(iface.join("tun_flags"), "0x1000\n").expect("write tun_flags");
+            }
+        }
+
+        let mut info = info_with_processes(&[]);
+        info.network = read_network_info_from(&dir).expect("read fake sysfs tree");
+        assert_eq!(
+            info.max_net_speed(),
+            1000,
+            "a custom-named tun device's fixed 10 Gb/s default must not decide the host link speed: {:?}",
+            info.network
+                .iter()
+                .map(|n| (n.name.as_str(), n.speed_mbps))
+                .collect::<Vec<_>>()
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_has_process() {
         let info = SystemInfo {
             kernel_version: String::new(),
@@ -1088,7 +2111,6 @@ mod tests {
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
                 somaxconn: 128,
-                tcp_fastopen: 0,
                 thp_enabled: "always".to_string(),
             },
             processes: vec![
@@ -1171,6 +2193,141 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// `dumb-init` is a container's PID 1, not a bare host's init system: it is
+    /// "designed to run as PID 1 inside minimal container environments", and
+    /// outside containers it runs as a child of a supervisor rather than as
+    /// PID 1. A container with no marker file left — the cgroup-v2 shape whose
+    /// `/proc/1/cgroup` is the namespace root `0::/` — must report Container,
+    /// exactly like its peer shim `tini`, which the whitelist never listed.
+    #[test]
+    fn runtime_env_reads_dumb_init_as_a_container_init() {
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_dumb_init_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+        // A private cgroup namespace: PID 1's own cgroup is the namespace root,
+        // so the cgroup check sees no container path.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+
+        fs::write(proc1.join("sched"), b"dumb-init (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(
+            runtime_env_from(&root),
+            RuntimeEnv::Container,
+            "dumb-init is a container's PID 1, not a bare host's init"
+        );
+
+        // Its peer shim, never whitelisted, already reads as a container.
+        fs::write(proc1.join("sched"), b"tini (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Guard: a real host init with the same cgroup is still a bare host.
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `/proc/1/sched` starts with PID 1's comm, which may hold non-UTF-8
+    /// bytes (set via prctl), and a cgroup path may too; `read_to_string`
+    /// rejected such a file, so a container fell through to `BareHost`.
+    #[test]
+    fn runtime_env_survives_non_utf8_pid1_files() {
+        let root = std::env::temp_dir().join(format!("ktuner_runtime_{}", std::process::id()));
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+
+        // Unknown init whose comm carries a raw byte, plain cgroup v2 path.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"app\xff (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Known init, but the container marker sits in a non-UTF-8 cgroup path.
+        fs::write(proc1.join("cgroup"), b"0::/kubepods/pod\xff\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Guard: a known init with a plain cgroup is still a bare host.
+        fs::write(proc1.join("cgroup"), b"0::/init.scope\n").expect("write cgroup");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// systemd's container interface: when systemd runs as PID 1 inside a
+    /// container it records the manager's name in `/run/systemd/container`
+    /// (from the `container=` variable the manager puts in its environment).
+    /// In a cgroup-v2 container that is the only signal left — `/proc/1/cgroup`
+    /// is the namespace root `0::/` and PID 1 is a known init, so every other
+    /// check reports a bare host.
+    #[test]
+    fn runtime_env_reads_the_systemd_container_marker() {
+        let root =
+            std::env::temp_dir().join(format!("ktuner_container_marker_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+        // An LXC container with systemd as PID 1 and a private cgroup namespace.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        let marker = root.join("run/systemd/container");
+        fs::create_dir_all(marker.parent().expect("marker parent")).expect("create run/systemd");
+
+        fs::write(&marker, b"lxc\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // A manager systemd does not know is still a container.
+        fs::write(&marker, b"some-unknown-manager\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // `wsl` is not a container manager here: WSL2's init exports it, but
+        // /proc/sys in WSL2 is the WSL kernel the workload runs on, so the
+        // bare-host verdict it already reports must not change.
+        fs::write(&marker, b"wsl\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        // An empty marker file names no manager.
+        fs::write(&marker, b"\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        // Guard: no marker file at all is still a bare host.
+        fs::remove_file(&marker).ok();
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Spawn an executable the test itself has just written or copied.
+    ///
+    /// On the CI runners' overlay filesystem the write-side close of that
+    /// fresh file can lag the `exec`-side open, so an immediate single-shot
+    /// spawn fails with `ETXTBSY` under load (#6638). `fs::write` and
+    /// `fs::copy` have both returned by then, so this is an incidental
+    /// timing assumption of the runner, not a property under test — retry
+    /// the spawn for a short bounded window, the same way `wait_for_cmdline`
+    /// retries the argv read.
+    fn spawn_fresh_executable(
+        command: &mut std::process::Command,
+        context: &str,
+    ) -> std::process::Child {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match command.spawn() {
+                Ok(child) => return child,
+                Err(err)
+                    if err.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => panic!("{context}: {err}"),
+            }
+        }
+    }
+
     /// Wait until a freshly spawned child's `/proc/<pid>/cmdline` carries
     /// `needle`.
     ///
@@ -1238,11 +2395,9 @@ mod tests {
         let exporter_path = dir.join("postgres_exporter");
         fs::copy("/bin/sleep", &exporter_path).expect("copy sleep to exporter name");
 
-        let mut exporter = std::process::Command::new(&exporter_path)
-            .arg("30")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn exporter-named process");
+        let mut command = std::process::Command::new(&exporter_path);
+        command.arg("30").stdout(std::process::Stdio::null());
+        let mut exporter = spawn_fresh_executable(&mut command, "spawn exporter-named process");
         let pid = exporter.id().to_string();
         wait_for_cmdline(&pid, b"postgres_exporter");
 
@@ -1256,6 +2411,177 @@ mod tests {
             helper,
             "a non-UTF-8 program path must not hide the collector"
         );
+    }
+
+    /// A client tool of a service names the service it talks to, not the
+    /// service: `has_process("clickhouse")` was satisfied by
+    /// `clickhouse-client` (ClickHouse ships its client as another name of the
+    /// same multi-call binary, and /proc/<pid>/comm truncates both the client
+    /// and the server to `clickhouse-clie` / `clickhouse-serv`, so the name
+    /// cannot separate them) — the same false-positive class #4100 removed for
+    /// the collectors and `etcdctl`, one step further.
+    #[test]
+    fn service_client_tool_is_not_the_service() {
+        let root = std::env::temp_dir().join(format!("ktuner_client_tool_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let client_path = root.join("clickhouse-client");
+        fs::copy("/bin/sleep", &client_path).expect("copy sleep to the client's name");
+
+        let mut command = std::process::Command::new(&client_path);
+        command.arg("30").stdout(std::process::Stdio::null());
+        let mut client = spawn_fresh_executable(&mut command, "spawn a client-named process");
+        let pid = client.id().to_string();
+        wait_for_cmdline(&pid, b"clickhouse-client");
+
+        // The kernel gives it the truncated server prefix as comm...
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("client comm")
+            .trim()
+            .to_string();
+        assert_eq!(comm, "clickhouse-clie");
+        // The process list must decide from the program, not that prefix.
+        let info = gather_system_info().expect("gather system info");
+        let listed_as_clickhouse = info.has_process("clickhouse");
+
+        client.kill().ok();
+        client.wait().ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !listed_as_clickhouse,
+            "a host running only the ClickHouse client must not look like a database host"
+        );
+    }
+
+    /// The same for a script: the kernel keeps the script's name in
+    /// /proc/<pid>/comm (`kafka-topics.sh`) while argv[0] is the interpreter
+    /// that runs it, so a tool script satisfied `has_process("kafka")` — and a
+    /// host that only administers a broker elsewhere then ran the streaming
+    /// rules and classified as a broker.
+    #[test]
+    fn service_tool_script_is_not_the_service() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ktuner_tool_script_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        // A Kafka client tool: the daemon itself runs as a JVM, so an
+        // executable named after the service is a tool of it.
+        let script = root.join("kafka-topics.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 30\n").expect("write tool script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+
+        let mut command = std::process::Command::new(&script);
+        command.stdout(std::process::Stdio::null());
+        let mut tool = spawn_fresh_executable(&mut command, "spawn a tool-named script");
+        let pid = tool.id().to_string();
+        wait_for_cmdline(&pid, b"kafka-topics.sh");
+
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("tool comm")
+            .trim()
+            .to_string();
+        let info = gather_system_info().expect("gather system info");
+        let listed_as_kafka = info.has_process("kafka");
+
+        tool.kill().ok();
+        tool.wait().ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(comm, "kafka-topics.sh");
+        assert!(
+            !listed_as_kafka,
+            "kafka-topics.sh is a client tool, not the broker"
+        );
+    }
+
+    /// A write handle still open on a fresh script fails an immediate
+    /// single-shot spawn with ETXTBSY — what the runners' lagging write-side
+    /// close looks like to exec (#6638) — so the spawn helper must retry
+    /// past it and win once the holder drops the file.
+    #[test]
+    fn spawn_retries_while_the_script_is_text_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ktuner_txtbusy_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let script = root.join("busy-tool.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 30\n").expect("write tool script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+
+        let mut command = std::process::Command::new(&script);
+        command.stdout(std::process::Stdio::null());
+
+        let (opened, busy) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&script)
+                .expect("hold the script open for writing");
+            opened.send(()).expect("signal the handle is held");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+        busy.recv().expect("wait for the write handle");
+
+        let mut tool = spawn_fresh_executable(&mut command, "spawn a busy script");
+
+        let pid = tool.id().to_string();
+        wait_for_cmdline(&pid, b"busy-tool.sh");
+        holder.join().expect("holder thread");
+        tool.kill().ok();
+        tool.wait().ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The program names the tool filter must catch and the daemon names it
+    /// must keep. ClickHouse is the case a name can never decide: its client,
+    /// server and the multi-call binary all share the `clickhouse` prefix, so
+    /// the filter is a list of the client-side names — the server name and the
+    /// bare multi-call binary (which runs the server) stay services.
+    #[test]
+    fn service_tool_names_exclude_the_daemons() {
+        for tool in [
+            // The vendor's clickhouse-client package ships each of these as a
+            // symlink to the multi-call binary.
+            "clickhouse-benchmark",
+            "clickhouse-client",
+            "clickhouse-compressor",
+            "clickhouse-format",
+            "clickhouse-local",
+            "clickhouse-obfuscator",
+            "/usr/bin/clickhouse-client",
+            // Scripts of a JVM-hosted service: the daemon itself is the JVM.
+            "kafka-topics.sh",
+            "kafka-server-start.sh",
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "spark-submit",
+            "hadoop-daemon.sh",
+            "elasticsearch-keystore",
+        ] {
+            assert!(
+                program_names_service_tool(tool),
+                "{tool} is a tool, not the service"
+            );
+        }
+        for daemon in [
+            "clickhouse",
+            "clickhouse-server",
+            "/usr/bin/clickhouse",
+            "kafka",
+            "spark",
+            "hadoop",
+            "elasticsearch",
+            "java",
+            "postgres",
+            "mysqld",
+            "memcached",
+            "nginx",
+        ] {
+            assert!(
+                !program_names_service_tool(daemon),
+                "{daemon} is the service, not a tool"
+            );
+        }
     }
 
     #[test]
@@ -1286,6 +2612,71 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_service_ignores_package_mentions_in_a_main_class() {
+        // A main class whose *package* mentions a service is a client of it,
+        // not the service: `com.example.kafka.ConsumerApp` consumes Kafka, it
+        // does not run a broker, and classifying it fired the streaming rules
+        // on an unrelated workload. Only the class's own name, or a package
+        // run the service owns from the root, decides.
+        let cmdline =
+            "java\u{0}-cp\u{0}/opt/kafka/libs/kafka_2.13-3.7.0.jar\u{0}com.example.kafka.ConsumerApp";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
+
+        let cmdline = "java\u{0}com.example.spark.JobLauncher";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
+
+        // Kafka's own broker class still decides, through its class name.
+        let cmdline = "java\u{0}kafka.Kafka";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
+    }
+
+    #[test]
+    fn test_runtime_service_matches_kafka_daemon_main_classes() {
+        // Kafka Connect workers and MirrorMaker 2 are daemons whose main
+        // class lives under the org.apache.kafka.connect package: the
+        // package run owns the program from the root, exactly like
+        // org.apache.zookeeper for QuorumPeerMain. With no kafka root
+        // mapped, the boundary rules left every one of them unclassified
+        // even though the pre-boundary scan reported Some("kafka").
+        for class in [
+            "org.apache.kafka.connect.runtime.ConnectDistributed",
+            "org.apache.kafka.connect.cli.ConnectStandalone",
+            "org.apache.kafka.connect.mirror.MirrorMaker",
+        ] {
+            let cmdline = format!("java\u{0}-Xmx1g\u{0}{class}");
+            assert_eq!(
+                runtime_service_from_cmdline(&cmdline),
+                Some("kafka"),
+                "{class}"
+            );
+        }
+
+        // Client and tool packages under org.apache.kafka are consumers of
+        // the service, not the service itself — the same contract that keeps
+        // com.example.kafka.ConsumerApp unclassified.
+        for class in [
+            "org.apache.kafka.clients.consumer.KafkaConsumer",
+            "org.apache.kafka.tools.consumer.ConsoleConsumer",
+            "org.apache.kafka.tools.ProducerPerformance",
+        ] {
+            let cmdline = format!("java\u{0}{class}");
+            assert_eq!(runtime_service_from_cmdline(&cmdline), None, "{class}");
+        }
+
+        // The legacy MirrorMaker main class and the broker still decide via
+        // their own names, and neighbouring services are untouched.
+        let cmdline = "java\0kafka.tools.MirrorMaker";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
+        let cmdline = "java\0org.apache.zookeeper.server.quorum.QuorumPeerMain";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("zookeeper"));
+        let cmdline = "java\0org.apache.catalina.startup.Bootstrap\0start";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("tomcat"));
+        let cmdline =
+            "java\u{0}-cp\u{0}/opt/kafka/libs/kafka_2.13-3.7.0.jar\u{0}com.example.kafka.ConsumerApp";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
+    }
+
+    #[test]
     fn test_runtime_service_matches_main_classes_and_jars() {
         // Zookeeper's main class.
         let cmdline = "java\0-Xmx1g\0org.apache.zookeeper.server.quorum.QuorumPeerMain";
@@ -1295,10 +2686,17 @@ mod tests {
         let cmdline = "java\0-jar\0/opt/kafka/libs/kafka_2.13-3.7.0.jar\0kafka.Kafka";
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
 
-        // Tomcat's bootstrap class carries `catalina` mid-class, so the
-        // marker must match as a token run anywhere in the class name.
+        // Tomcat's bootstrap class names neither tomcat nor catalina, so the
+        // `org.apache.catalina` package run decides.
         let cmdline = "java\0org.apache.catalina.startup.Bootstrap\0start";
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("tomcat"));
+
+        // Solr and Pulsar main classes likewise carry the service only in
+        // their package run, not in the class name.
+        let cmdline = "java\0org.apache.solr.servlet.SolrDispatchFilter";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("solr"));
+        let cmdline = "java\0org.apache.pulsar.PulsarBrokerStarter\0--broker-conf";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("pulsar"));
 
         // Elasticsearch, including a versioned jar basename.
         let cmdline = "java\0-jar\0/usr/share/elasticsearch-8.12.0/lib/elasticsearch-8.12.0.jar";
@@ -1316,10 +2714,11 @@ mod tests {
         let exporter_path = dir.join("postgres_exporter");
         fs::copy("/bin/sleep", &exporter_path).expect("copy sleep to exporter name");
 
-        let mut exporter = std::process::Command::new(&exporter_path)
-            .arg("30")
-            .spawn()
-            .expect("spawn exporter-named process");
+        let mut exporter = {
+            let mut command = std::process::Command::new(&exporter_path);
+            command.arg("30");
+            spawn_fresh_executable(&mut command, "spawn exporter-named process")
+        };
         let mut service = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1422,4 +2821,50 @@ mod tests {
         ));
         assert!(!cmdline_names_helper("".split('\0')));
     }
+
+    #[test]
+    fn cmdline_names_helper_recognizes_a_jvm_collector() {
+        // The Prometheus JMX exporter's documented standalone form: the jar
+        // after -jar names the program, and its name carries no "exporter"
+        // token. Before the JVM form was known, argv[0] "java" hid the
+        // collector and a metrics-only host was detected as a Java workload.
+        assert!(cmdline_names_helper(
+            "java\0-jar\0jmx_prometheus_httpserver-1.2.1.jar\x005556\0config.yaml".split('\0')
+        ));
+        // A path to the jar resolves by its basename.
+        assert!(cmdline_names_helper(
+            "/usr/bin/java\0-jar\0/opt/exporters/jmx_prometheus_httpserver.jar".split('\0')
+        ));
+        // Other JVM collectors carry the token.
+        assert!(cmdline_names_helper(
+            "java\0-jar\0/opt/cassandra_exporter-2.3.8.jar".split('\0')
+        ));
+    }
+
+    #[test]
+    fn cmdline_names_helper_keeps_jvm_workloads_visible() {
+        // The -javaagent form attaches the exporter TO the monitored
+        // application: that process is the workload, and only the -jar value
+        // may decide.
+        assert!(!cmdline_names_helper(
+            "java\0-javaagent:jmx_prometheus_javaagent-1.2.1.jar\0-jar\0cassandra.jar".split('\0')
+        ));
+        // A workload jar with no collector token stays a workload...
+        assert!(!cmdline_names_helper(
+            "java\0-jar\0/opt/cassandra/apache-cassandra-4.1.0.jar".split('\0')
+        ));
+        // ...and the arguments around -jar never decide.
+        assert!(!cmdline_names_helper(
+            "java\0-jar\0app.jar\0--config=/etc/exporter.conf".split('\0')
+        ));
+        assert!(!cmdline_names_helper(
+            "java\0-Xmx1g\0com.example.Main".split('\0')
+        ));
+        // A dangling -jar decides nothing.
+        assert!(!cmdline_names_helper("java\0-jar".split('\0')));
+    }
 }
+
+#[cfg(test)]
+#[path = "cpu_hierarchy_tests.rs"]
+mod cpu_hierarchy_tests;

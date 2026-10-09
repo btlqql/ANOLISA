@@ -35,11 +35,32 @@ enum Commands {
     /// Explain why a parameter should be changed
     Why { param: String },
     /// Roll back all applied changes
-    Rollback,
+    Rollback {
+        /// Show what a rollback would restore, without changing anything
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // README's JSON output contract: "Errors go to stderr as JSON." A usage
+    // error fires before any command runs, so parsing must not exit through
+    // clap's own plain-text renderer — an agent reading stderr JSON (the
+    // documented shape) has to be able to read this one too. `--help` and
+    // `--version` are not errors: clap keeps rendering them on stdout with
+    // exit 0.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if e.use_stderr() => {
+            let out = json!({ "error": e.to_string().trim_end() });
+            eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+            std::process::exit(e.exit_code());
+        }
+        Err(e) => {
+            print!("{e}");
+            std::process::exit(e.exit_code());
+        }
+    };
     let result = match cli.command {
         Commands::Check {
             category: cat,
@@ -52,7 +73,7 @@ fn main() {
         } => cmd_tune(dry_run, conservative, cat),
         Commands::Fix { param } => cmd_fix(&param),
         Commands::Why { param } => cmd_why(&param),
-        Commands::Rollback => cmd_rollback(),
+        Commands::Rollback { list } => cmd_rollback(list),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -84,12 +105,7 @@ fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
 
     let score = eval.score();
     let counts = category::RecCounts::from_recs(&recs);
-    // What `score` would report once this view has been applied. Not
-    // `score + shown weight`: `score` is floored at 30, so adding the shown
-    // weight counts that floor as a gain and promises points the untouched
-    // findings still keep off the board (on a 66-finding host,
-    // `--conservative` promised 72 while applying it lands on the floor, 30).
-    let predicted_score = eval.score_after_applying(&recs);
+    let predicted_score = predicted_score(&eval, &recs);
 
     let recs_json: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
 
@@ -120,6 +136,60 @@ fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
     Ok(code)
 }
 
+/// Why a real `tune` run leaves a recommendation out: the parameter is not
+/// writable here. A parameter that is both unwritable and runtime-dangerous
+/// is reported as `unwritable` only, so the two reasons partition the skipped
+/// set exactly once — the counts in `tune_short_circuit` and the entries
+/// `would_skip` lists both rely on that.
+const UNWRITABLE: &str = "unwritable";
+/// Why a real `tune` run leaves a writable recommendation out: writing it at
+/// runtime is unsafe.
+const RUNTIME_DANGEROUS: &str = "runtime_dangerous";
+
+/// Why a real `tune` run would leave `rec` out, or `None` when this
+/// environment can take it. Pure, so the applicability filter, the
+/// short-circuit counts and the dry-run preview classify one list identically.
+fn skip_reason(rec: &Recommendation) -> Option<&'static str> {
+    if !rec.writable {
+        Some(UNWRITABLE)
+    } else if category::is_runtime_dangerous(&rec.param) {
+        Some(RUNTIME_DANGEROUS)
+    } else {
+        None
+    }
+}
+
+/// What `score` would report once this environment's plan has run: the
+/// penalty of everything the plan leaves, i.e. the findings outside `view`
+/// plus the entries `skip_reason` says no write path will take. Not
+/// `score + shown weight`: `score` is floored at 30, so adding the shown
+/// weight counts that floor as a gain and promises points the untouched
+/// findings still keep off the board (on a 66-finding host, `--conservative`
+/// promised 72 while applying it lands on the floor, 30). And not the whole
+/// view either, which is the same promise one step further out: counting the
+/// skipped entries predicted a score `tune` cannot deliver — on a container
+/// whose /proc/sys is read-only every entry is skipped and `check` reported
+/// the tuned score while the plan answered "blocked, applied 0".
+fn predicted_score(eval: &rules::EvalResult, view: &[Recommendation]) -> usize {
+    let applicable: Vec<Recommendation> = view
+        .iter()
+        .filter(|rec| skip_reason(rec).is_none())
+        .cloned()
+        .collect();
+    eval.score_after_applying(&applicable)
+}
+
+/// The `would_skip` payload: every in-scope recommendation a real run would
+/// leave out, in plan order, with the reason it is left out.
+fn would_skip_json(in_scope: &[Recommendation]) -> Vec<serde_json::Value> {
+    in_scope
+        .iter()
+        .filter_map(|rec| {
+            skip_reason(rec).map(|reason| json!({ "param": rec.param, "reason": reason }))
+        })
+        .collect()
+}
+
 /// Why `ktuner tune` exited without applying anything. Pure so the
 /// status/exit-code decision is unit-testable without touching the system.
 ///
@@ -140,12 +210,17 @@ fn tune_short_circuit(
     }
     // Recommendations exist but every one was filtered out before any write.
     // Reporting "optimal" here is false: `check` exits 1 on the same host.
-    // A rec that is both unwritable and runtime-dangerous counts only as
-    // unwritable, so the two counts always add up to in_scope.len().
-    let unwritable = in_scope.iter().filter(|r| !r.writable).count();
+    // skip_reason classifies each rec exactly once, so the two counts always
+    // add up to in_scope.len(). A non-dry-run tune answers with this body
+    // too, and the counts alone cannot be reconciled with what `check` keeps
+    // reporting — `would_skip` names the entries, same shape as the preview.
+    let unwritable = in_scope
+        .iter()
+        .filter(|r| skip_reason(r) == Some(UNWRITABLE))
+        .count();
     let runtime_dangerous = in_scope
         .iter()
-        .filter(|r| r.writable && category::is_runtime_dangerous(&r.param))
+        .filter(|r| skip_reason(r) == Some(RUNTIME_DANGEROUS))
         .count();
     Some((
         json!({
@@ -154,6 +229,7 @@ fn tune_short_circuit(
             "recommendations": in_scope.len(),
             "blocked_unwritable": unwritable,
             "blocked_runtime_dangerous": runtime_dangerous,
+            "would_skip": would_skip_json(in_scope),
         }),
         // Mirror check's exit-1 "has recommendations" convention: the system
         // is not optimal, tune simply cannot act on it in this environment.
@@ -167,17 +243,82 @@ fn tune_short_circuit(
 /// The preview carries the same status vocabulary as the short-circuit path:
 /// reaching here means at least one recommendation is applicable, so the
 /// status is `"planned"` — never `"optimal"`, which the short-circuit path
-/// reserves for a host with nothing to recommend. `blocked` counts the
-/// recommendations this environment filtered out (unwritable or
-/// runtime-dangerous), so a script can tell a partial plan from a complete
-/// one without diffing `would_apply`.
-fn dry_run_output(applicable: &[Recommendation], requested: usize) -> serde_json::Value {
+/// reserves for a host with nothing to recommend. `would_apply` lists the
+/// entries a real run would write; `would_skip` names the ones this
+/// environment filtered out, with the reason, so the parameters a partial
+/// plan leaves behind are visible and not just counted. `blocked` stays their
+/// count.
+fn dry_run_output(in_scope: &[Recommendation], applicable: &[Recommendation]) -> serde_json::Value {
     let recs_json: Vec<serde_json::Value> = applicable.iter().map(rec_json).collect();
+    let would_skip = would_skip_json(in_scope);
     json!({
         "dry_run": true,
         "status": "planned",
-        "blocked": requested - applicable.len(),
+        "blocked": would_skip.len(),
         "would_apply": recs_json,
+        "would_skip": would_skip,
+    })
+}
+
+/// Extend a short-circuit body with the keys a `--dry-run` caller reads.
+///
+/// `--dry-run` answers with `dry_run`, `would_apply`, `would_skip` and
+/// `blocked` on every host: the short-circuit shapes predate the flag, so a
+/// host where every recommendation was filtered out answered with none of
+/// them and a script could not tell that invocation from a non-dry-run one —
+/// it read `would_apply`, found nothing and had no way to distinguish
+/// "nothing to plan" from "the flag was ignored". `would_apply` is empty here
+/// because nothing is applicable, `would_skip` lists everything in scope,
+/// `blocked` stays its length (the count the planned shape reports, and the
+/// sum of the short-circuit's `blocked_unwritable` /
+/// `blocked_runtime_dangerous` partitions), and `status` keeps the
+/// short-circuit vocabulary (`optimal` / `blocked`).
+fn dry_run_preview(mut body: serde_json::Value, in_scope: &[Recommendation]) -> serde_json::Value {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("dry_run".to_string(), json!(true));
+        object
+            .entry("would_apply".to_string())
+            .or_insert_with(|| json!([]));
+        let would_skip = would_skip_json(in_scope);
+        object.insert("blocked".to_string(), json!(would_skip.len()));
+        object.insert("would_skip".to_string(), json!(would_skip));
+    }
+    body
+}
+
+/// JSON body of a real (non-dry-run) `tune` run. Pure so the body stays
+/// unit-testable without root: a real `tune` only runs as root, and its
+/// accounting — what a partial plan wrote, what failed, what the kernel
+/// adjusted — must stay assertable on a dev host.
+///
+/// `would_skip` names the entries this environment filtered out (unwritable
+/// or runtime-dangerous), in the dry-run preview's shape: a partial tune
+/// answers exit 0 while `check` keeps exiting 1 on the same host, and the
+/// filtered entries are exactly the difference between the two — without
+/// them in the body, a caller cannot reconcile a real `tune` with `check`
+/// or with its own dry-run preview.
+fn tune_output(
+    in_scope: &[Recommendation],
+    outcome: &tuner::ApplyOutcome,
+    score_before: usize,
+    score_after: usize,
+) -> serde_json::Value {
+    let failed: Vec<serde_json::Value> = outcome
+        .failed
+        .iter()
+        .map(|f| json!({ "param": f.param, "error": f.error }))
+        .collect();
+    // Disjoint from `failed`: parameters the kernel accepted but adjusted.
+    // They ARE applied (with the kernel's value) and are recorded in the
+    // rollback ledger / sysctl.d; the note makes the delta visible (#4160).
+    let clamped = serde_json::to_value(&outcome.clamped).unwrap_or_else(|_| json!([]));
+    json!({
+        "applied": outcome.applied,
+        "failed": failed,
+        "clamped": clamped,
+        "score_before": score_before,
+        "score_after": score_after,
+        "would_skip": would_skip_json(in_scope),
     })
 }
 
@@ -205,45 +346,34 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
     // recommend" from "recommended, but nothing applicable here" (e.g. root
     // in a container with read-only /proc/sys, where every rec is refreshed
     // as unwritable) — reporting optimal in the latter case contradicts
-    // check's exit 1 on the same host.
+    // check's exit 1 on the same host. The dry-run preview lists the filtered
+    // entries themselves through the same skip_reason.
     let applicable: Vec<Recommendation> = recs
         .iter()
-        .filter(|r| r.writable && !category::is_runtime_dangerous(&r.param))
+        .filter(|r| skip_reason(r).is_none())
         .cloned()
         .collect();
-    let requested = recs.len();
     if let Some((output, code)) = tune_short_circuit(&recs, applicable.len()) {
+        let output = if dry_run {
+            dry_run_preview(output, &recs)
+        } else {
+            output
+        };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(code);
     }
-    let recs = applicable;
 
     if dry_run {
-        let output = dry_run_output(&recs, requested);
+        let output = dry_run_output(&recs, &applicable);
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(0);
     }
 
-    let outcome = tuner::apply_quiet(&recs)?;
+    let outcome = tuner::apply_quiet(&applicable)?;
     let (_, eval_after) = gather()?;
     let score_after = eval_after.score();
 
-    let failed: Vec<serde_json::Value> = outcome
-        .failed
-        .iter()
-        .map(|f| json!({ "param": f.param, "error": f.error }))
-        .collect();
-    // Disjoint from `failed`: parameters the kernel accepted but adjusted.
-    // They ARE applied (with the kernel's value) and are recorded in the
-    // rollback ledger / sysctl.d; the note makes the delta visible (#4160).
-    let clamped = serde_json::to_value(&outcome.clamped)?;
-    let output = json!({
-        "applied": outcome.applied,
-        "failed": failed,
-        "clamped": clamped,
-        "score_before": score_before,
-        "score_after": score_after,
-    });
+    let output = tune_output(&recs, &outcome, score_before, score_after);
     println!("{}", serde_json::to_string_pretty(&output)?);
     // Mirror `check`'s exit convention (1 = attention needed): a tune that
     // failed some or all writes must not report success — the old code exited
@@ -254,14 +384,33 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
 
 /// Normalize a user-supplied parameter name for lookup: sysfs names
 /// (`block/...`, `transparent_hugepage/...`) are filesystem identities and
-/// must stay verbatim, while sysctl names accept slash/dot and case
-/// variants.
+/// must stay verbatim. Sysctl namespaces accept slash/dot and case variants,
+/// but network interface identities retain their case and literal dots.
 fn normalize_param(param: &str) -> String {
     if param.starts_with("block/") || param.starts_with("transparent_hugepage/") {
-        param.to_string()
-    } else {
-        param.replace('/', ".").to_lowercase()
+        return param.to_string();
     }
+    for proto in ["ipv4", "ipv6"] {
+        for family in ["conf", "neigh"] {
+            let prefix = format!("net.{proto}.{family}.");
+            if param
+                .get(..prefix.len())
+                .is_some_and(|p| p.replace('/', ".").eq_ignore_ascii_case(&prefix))
+            {
+                let rest = &param[prefix.len()..];
+                if let Some((iface, property)) =
+                    rest.rsplit_once('/').or_else(|| rest.rsplit_once('.'))
+                {
+                    return format!(
+                        "net.{proto}.{family}.{iface}.{}",
+                        property.to_ascii_lowercase()
+                    );
+                }
+                return format!("net.{proto}.{family}.{rest}");
+            }
+        }
+    }
+    param.replace('/', ".").to_lowercase()
 }
 
 /// Find the recommendation for a user-supplied parameter name, accepting the
@@ -274,7 +423,7 @@ fn find_recommendation<'a>(
     let normalized = normalize_param(param);
     eval.recommendations
         .iter()
-        .find(|r| r.param == param || r.param == normalized)
+        .find(|r| r.param == param || normalize_param(&r.param) == normalized)
 }
 
 fn cmd_fix(param: &str) -> Result<i32> {
@@ -297,18 +446,22 @@ fn cmd_fix(param: &str) -> Result<i32> {
             "parameter {param} is dangerous to write at runtime, persist to /etc/sysctl.d instead"
         );
     }
-    let fix_outcome = tuner::apply_one(rec)?;
+    let fix = tuner::apply_one(rec)?;
     let (_, eval_after) = gather()?;
     let mut output = json!({
         "fixed": param,
-        "previous": rec.current_value,
+        // The original the ledger recorded under the transaction lock — the
+        // value `ktuner rollback` restores. The gathered rec.current_value
+        // can be stale (the knob moved between gather and apply), and
+        // reporting it here contradicted the ledger and `rollback --list`.
+        "previous": fix.recorded_previous,
         // What the kernel actually took — equals the recommendation unless
         // the kernel clamped/normalized the write (#4160).
-        "applied": fix_outcome.effective,
+        "applied": fix.outcome.effective,
         "score_after": eval_after.score(),
         "remaining": eval_after.recommendations.len(),
     });
-    if fix_outcome.clamped {
+    if fix.outcome.clamped {
         output["requested"] = json!(rec.recommended_value);
         output["note"] = json!("内核实际生效值与推荐值不同（已按实际生效值记录并持久化，可回滚）");
     }
@@ -332,6 +485,16 @@ fn cmd_why(param: &str) -> Result<i32> {
     Ok(code)
 }
 
+/// The value a parameter currently holds, read the way every other consumer
+/// reads it: the shared [`tuner::active_value`] — the same reading the rules
+/// store as a recommendation's `current`, the ledger now records as an
+/// original, and `classify_readback` returns as the effective value. Keeping
+/// one implementation in the library is what makes the claim true: a second
+/// copy here would drift the moment either side learned a new file shape.
+fn active_value(value: &str) -> String {
+    tuner::active_value(value)
+}
+
 fn why_with(
     param: &str,
     eval: &rules::EvalResult,
@@ -340,7 +503,7 @@ fn why_with(
     // sysfs names are filesystem identities, while sysctl names accept aliases.
     let normalized = normalize_param(param);
     if let Some(rec) = find_recommendation(eval, param) {
-        let output = json!({
+        let mut output = json!({
             "param": rec.param,
             "current": rec.current_value,
             "recommended": rec.recommended_value,
@@ -350,12 +513,22 @@ fn why_with(
             "subcategory": category::param_subcategory(&rec.param),
             "writable": rec.writable,
         });
+        // The same skip classification the plan uses (#6134's would_skip):
+        // a recommendation `why` explains can be one no write path will ever
+        // take — unwritable here, or runtime-dangerous, which tune skips and
+        // fix refuses outright. Without the reason, `writable: true` on a
+        // runtime-dangerous knob told the agent the opposite of what every
+        // apply path does.
+        if let Some(reason) = skip_reason(rec) {
+            output["skip_reason"] = json!(reason);
+        }
         return Ok((output, 1));
     }
     let path = tuner::param_to_path(&normalized);
     match read_current(&path) {
         Ok(Some(val)) => {
-            let output = json!({ "param": normalized, "current": val.trim(), "status": "optimal" });
+            let output =
+                json!({ "param": normalized, "current": active_value(&val), "status": "optimal" });
             Ok((output, 0))
         }
         Ok(None) => anyhow::bail!("parameter not found: {param}"),
@@ -366,10 +539,36 @@ fn why_with(
     }
 }
 
-fn cmd_rollback() -> Result<i32> {
+/// JSON shape of `ktuner rollback --list`. Pure so the agent-facing contract
+/// (key names, count, entry fields, ordering) is unit-testable without a
+/// ledger on disk. Entries arrive as `rollback_preview` returns them:
+/// (param, applied, previous), sorted by param (BTreeMap order).
+fn rollback_list_output(entries: &[(String, String, String)]) -> serde_json::Value {
+    json!({
+        "count": entries.len(),
+        "pending": entries
+            .iter()
+            .map(|(param, applied, previous)| {
+                json!({ "param": param, "applied": applied, "previous": previous })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn cmd_rollback(list: bool) -> Result<i32> {
     let is_root = unsafe { libc::geteuid() } == 0;
     if !is_root {
         anyhow::bail!("rollback requires root (sudo ktuner rollback)");
+    }
+    if list {
+        // Read-only: no writes, no ledger deletion, no systemd changes. The
+        // ledger is 0600 in a 0700 root-owned dir, so --list shares
+        // rollback's root requirement; a corrupt ledger surfaces as an error
+        // here WITHOUT the destructive path having run first.
+        let entries = tuner::rollback_preview()?;
+        let output = rollback_list_output(&entries);
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(0);
     }
     let outcome = tuner::rollback_quiet()?;
     let status = tuner::classify_rollback(&outcome);
@@ -380,7 +579,15 @@ fn cmd_rollback() -> Result<i32> {
         "status": format!("{status:?}"),
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(if outcome.is_complete() { 0 } else { 1 })
+    Ok(rollback_exit_code(&outcome))
+}
+
+fn rollback_exit_code(outcome: &tuner::RollbackOutcome) -> i32 {
+    if outcome.is_complete() {
+        0
+    } else {
+        1
+    }
 }
 
 fn gather() -> Result<(detect::SystemInfo, rules::EvalResult)> {
@@ -395,8 +602,13 @@ fn gather() -> Result<(detect::SystemInfo, rules::EvalResult)> {
 /// used to exist in two shapes — rec_json dropped `subcategory` and
 /// `writable`, leaving dry-run entries with 6 keys where check emits 8 — so
 /// an agent diffing the two views saw the same `param` under two schemas.
+///
+/// An entry no write path will take carries the same `skip_reason` the plan
+/// publishes (`unwritable` or `runtime_dangerous`, from the shared helper
+/// behind `would_skip`), so `check` — like `why` — never contradicts the
+/// plan it is reconciled against.
 fn rec_json(r: &Recommendation) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "param": r.param,
         "current": r.current_value,
         "recommended": r.recommended_value,
@@ -405,12 +617,196 @@ fn rec_json(r: &Recommendation) -> serde_json::Value {
         "category": format!("{:?}", r.category).to_lowercase(),
         "subcategory": category::param_subcategory(&r.param),
         "writable": r.writable,
-    })
+    });
+    if let Some(reason) = skip_reason(r) {
+        value["skip_reason"] = json!(reason);
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_normalization_preserves_interface_identity() {
+        for proto in ["ipv4", "ipv6"] {
+            for iface in ["Br0", "Br0.100", "br0.100", "lo"] {
+                for input in [
+                    format!("net/{proto}/conf/{iface}/forwarding"),
+                    format!("net.{proto}.conf.{iface}.forwarding"),
+                    format!("NET/{proto}/CONF/{iface}/FORWARDING"),
+                    format!("net/{proto}.conf/{iface}/forwarding"),
+                ] {
+                    assert_eq!(
+                        normalize_param(&input),
+                        format!("net.{proto}.conf.{iface}.forwarding")
+                    );
+                }
+            }
+        }
+        assert_eq!(normalize_param("VM/SWAPPINESS"), "vm.swappiness");
+        assert_eq!(
+            normalize_param("block/Disk.0/scheduler"),
+            "block/Disk.0/scheduler"
+        );
+    }
+
+    #[test]
+    fn network_lookup_does_not_match_a_different_interface() {
+        let eval = rules::EvalResult {
+            recommendations: vec![
+                rec("net.ipv4.conf.br0.100.forwarding", true),
+                rec("net/ipv4/conf/Br0.100/forwarding", true),
+            ],
+            total_checked: 2,
+        };
+        let found = find_recommendation(&eval, "net.ipv4.conf.Br0.100.forwarding").unwrap();
+        assert_eq!(found.param, "net/ipv4/conf/Br0.100/forwarding");
+        assert!(find_recommendation(&eval, "net.ipv4.conf.BR0.100.forwarding").is_none());
+    }
+
+    #[test]
+    fn network_why_reads_the_requested_interface_path() {
+        let eval = rules::EvalResult {
+            recommendations: vec![],
+            total_checked: 0,
+        };
+        for proto in ["ipv4", "ipv6"] {
+            for input in [
+                format!("net/{proto}/conf/Br0.100/forwarding"),
+                format!("net.{proto}.conf.Br0.100.forwarding"),
+            ] {
+                let (output, code) = why_with(&input, &eval, |path| {
+                    assert_eq!(
+                        path,
+                        format!("/proc/sys/net/{proto}/conf/Br0.100/forwarding")
+                    );
+                    Ok(Some("1\n".into()))
+                })
+                .unwrap();
+                assert_eq!(code, 0);
+                assert_eq!(output["current"], "1");
+            }
+        }
+    }
+
+    #[test]
+    fn neighbour_normalization_preserves_interface_identity() {
+        // The neighbour family has the same literal-dot interfaces as conf,
+        // so the same identity rule applies: the interface segment keeps its
+        // case and dots, the property is lower-cased.
+        for proto in ["ipv4", "ipv6"] {
+            for iface in ["Br0", "Br0.100", "br0.100", "lo"] {
+                for input in [
+                    format!("net/{proto}/neigh/{iface}/gc_thresh3"),
+                    format!("net.{proto}.neigh.{iface}.gc_thresh3"),
+                    format!("NET/{proto}/NEIGH/{iface}/GC_THRESH3"),
+                    format!("net/{proto}.neigh/{iface}/gc_thresh3"),
+                ] {
+                    assert_eq!(
+                        normalize_param(&input),
+                        format!("net.{proto}.neigh.{iface}.gc_thresh3")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neighbour_why_reads_the_requested_interface_path() {
+        let eval = rules::EvalResult {
+            recommendations: vec![],
+            total_checked: 0,
+        };
+        for proto in ["ipv4", "ipv6"] {
+            for input in [
+                format!("net/{proto}/neigh/Br0.100/gc_thresh3"),
+                format!("net.{proto}.neigh.Br0.100.gc_thresh3"),
+            ] {
+                let (output, code) = why_with(&input, &eval, |path| {
+                    assert_eq!(
+                        path,
+                        format!("/proc/sys/net/{proto}/neigh/Br0.100/gc_thresh3")
+                    );
+                    Ok(Some("8192\n".into()))
+                })
+                .unwrap();
+                assert_eq!(code, 0);
+                assert_eq!(output["current"], "8192");
+            }
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn rollback_exit_code_reports_complete_and_incomplete_outcomes() {
+        for (name, restored, failed, skipped, expected) in [
+            ("empty ledger", 0, 0, 0, 0),
+            ("fully restored", 3, 0, 0, 0),
+            ("all failed", 0, 2, 0, 1),
+            ("all skipped", 0, 0, 2, 1),
+            ("failed and skipped", 0, 1, 1, 1),
+            ("partially failed", 2, 1, 0, 1),
+            ("partially skipped", 2, 0, 1, 1),
+            ("mixed incomplete", 2, 1, 1, 1),
+        ] {
+            let outcome = tuner::RollbackOutcome {
+                restored,
+                failed,
+                skipped,
+            };
+            assert_eq!(rollback_exit_code(&outcome), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn rollback_list_output_empty() {
+        // Empty ledger: count 0, empty pending — still a valid listing.
+        assert_eq!(
+            rollback_list_output(&[]),
+            json!({ "count": 0, "pending": [] })
+        );
+    }
+
+    #[test]
+    fn rollback_list_output_maps_every_field() {
+        let entries = vec![
+            (
+                "vm.swappiness".to_string(),
+                "1".to_string(),
+                "60".to_string(),
+            ),
+            (
+                "block/sda/scheduler".to_string(),
+                "none".to_string(),
+                "mq-deadline".to_string(),
+            ),
+        ];
+        assert_eq!(
+            rollback_list_output(&entries),
+            json!({
+                "count": 2,
+                "pending": [
+                    { "param": "vm.swappiness", "applied": "1", "previous": "60" },
+                    { "param": "block/sda/scheduler", "applied": "none", "previous": "mq-deadline" },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn rollback_list_output_preserves_entry_order() {
+        // The shaper must not re-sort: rollback_preview's BTreeMap order is
+        // the contract.
+        let entries = vec![
+            ("zzz".to_string(), "1".to_string(), "2".to_string()),
+            ("aaa".to_string(), "3".to_string(), "4".to_string()),
+        ];
+        let out = rollback_list_output(&entries);
+        assert_eq!(out["pending"][0]["param"], json!("zzz"));
+        assert_eq!(out["pending"][1]["param"], json!("aaa"));
+    }
+
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -452,6 +848,11 @@ mod tests {
                 "recommendations": 3,
                 "blocked_unwritable": 3,
                 "blocked_runtime_dangerous": 0,
+                "would_skip": [
+                    { "param": "vm.swappiness", "reason": "unwritable" },
+                    { "param": "fs.file-max", "reason": "unwritable" },
+                    { "param": "net.core.somaxconn", "reason": "unwritable" },
+                ],
             })
         );
     }
@@ -503,22 +904,169 @@ mod tests {
     }
 
     #[test]
+    fn tune_short_circuit_blocked_names_every_skipped_entry() {
+        // A real (non-dry-run) blocked tune answers with this body as-is: the
+        // counts alone cannot be reconciled with the recommendations `check`
+        // keeps reporting (exit 1) on the same host. The dry-run preview got
+        // the names (#6134); the real run needs the same list, or a caller
+        // reading plain `tune` output still cannot tell which parameters the
+        // environment dropped.
+        let recs = vec![
+            rec("vm.swappiness", false),  // unwritable
+            rec("vm.nr_hugepages", true), // writable but runtime-dangerous
+        ];
+        let (output, code) = tune_short_circuit(&recs, 0).expect("all blocked short-circuits");
+        assert_eq!(code, 1);
+        assert_eq!(
+            output["would_skip"],
+            json!([
+                { "param": "vm.swappiness", "reason": "unwritable" },
+                { "param": "vm.nr_hugepages", "reason": "runtime_dangerous" },
+            ]),
+            "a blocked tune must name what it dropped, not only count it: {output}"
+        );
+    }
+
+    #[test]
+    fn tune_output_names_what_the_environment_skipped() {
+        // A partial real tune never short-circuits, so the filtered entries
+        // are only visible in its output body: without `would_skip` a tune
+        // that applied something answers exit 0 while `check` keeps exiting 1
+        // on the same host, and nothing in the output explains the
+        // difference. The list must carry the dry-run preview's shape so a
+        // script can diff the preview against the real run.
+        let in_scope = vec![
+            rec("vm.swappiness", true),   // applicable
+            rec("fs.file-max", false),    // unwritable
+            rec("vm.nr_hugepages", true), // writable but runtime-dangerous
+        ];
+        let outcome = tuner::ApplyOutcome {
+            applied: 1,
+            failed: vec![],
+            clamped: vec![],
+        };
+        let output = tune_output(&in_scope, &outcome, 30, 35);
+        assert_eq!(output["applied"], json!(1));
+        assert_eq!(output["failed"], json!([]));
+        assert_eq!(
+            output["would_skip"],
+            json!([
+                { "param": "fs.file-max", "reason": "unwritable" },
+                { "param": "vm.nr_hugepages", "reason": "runtime_dangerous" },
+            ]),
+            "a real tune must name what the environment filtered out: {output}"
+        );
+        // Nothing failed or clamped here, so applied + would_skip partitions
+        // the in-scope recommendations exactly.
+        assert_eq!(
+            output["applied"].as_u64().unwrap()
+                + output["would_skip"].as_array().unwrap().len() as u64,
+            in_scope.len() as u64
+        );
+        // A host with nothing filtered reports the same keys, empty list.
+        let clean = tune_output(&[rec("vm.swappiness", true)], &outcome, 30, 35);
+        assert_eq!(clean["would_skip"], json!([]));
+    }
+
+    #[test]
     fn dry_run_output_reports_planned_and_blocked_count() {
         // Two applicable recommendations out of three gathered: the preview
         // must carry the short-circuit status vocabulary ("planned", never
-        // "optimal") and the count this environment filtered out, so a script
-        // can tell a partial plan from a complete one without diffing
-        // would_apply.
+        // "optimal") and name the one this environment filtered out, so a
+        // script can tell a partial plan from a complete one.
         let recs = vec![rec("vm.swappiness", true), rec("fs.file-max", true)];
-        let output = dry_run_output(&recs, 3);
+        let in_scope = vec![
+            rec("vm.swappiness", true),
+            rec("net.core.somaxconn", false),
+            rec("fs.file-max", true),
+        ];
+        let output = dry_run_output(&in_scope, &recs);
         assert_eq!(output["dry_run"], json!(true));
         assert_eq!(output["status"], json!("planned"));
         assert_eq!(output["blocked"], json!(1));
         assert_eq!(output["would_apply"].as_array().map(Vec::len), Some(2));
-        // A fully applicable plan reports zero blocked.
-        let full = dry_run_output(&recs, 2);
+        assert_eq!(
+            output["would_skip"],
+            json!([{ "param": "net.core.somaxconn", "reason": "unwritable" }])
+        );
+        // A fully applicable plan reports nothing blocked or skipped.
+        let full = dry_run_output(&recs, &recs);
         assert_eq!(full["status"], json!("planned"));
         assert_eq!(full["blocked"], json!(0));
+        assert_eq!(full["would_skip"], json!([]));
+    }
+
+    #[test]
+    fn dry_run_output_lists_every_skipped_entry_with_its_reason() {
+        // The preview has to name what a real run leaves out, not just count
+        // it: a script reconciling the plan against `check` needs the
+        // parameters, and the reason has to match the classification the
+        // short-circuit counts use.
+        let in_scope = vec![
+            rec("vm.swappiness", true),   // applicable
+            rec("fs.file-max", false),    // unwritable
+            rec("vm.nr_hugepages", true), // writable but runtime-dangerous
+        ];
+        let output = dry_run_output(&in_scope, &[rec("vm.swappiness", true)]);
+        assert_eq!(
+            output["would_skip"],
+            json!([
+                { "param": "fs.file-max", "reason": "unwritable" },
+                { "param": "vm.nr_hugepages", "reason": "runtime_dangerous" },
+            ])
+        );
+        assert_eq!(
+            output["blocked"].as_u64().unwrap(),
+            output["would_skip"].as_array().unwrap().len() as u64,
+            "blocked stays the skip-list length: {output}"
+        );
+        // A parameter that is both unwritable and runtime-dangerous counts as
+        // unwritable only, exactly like the short-circuit partition.
+        let both = vec![rec("vm.nr_hugepages", false)];
+        let output = dry_run_output(&both, &[]);
+        assert_eq!(
+            output["would_skip"],
+            json!([{ "param": "vm.nr_hugepages", "reason": "unwritable" }])
+        );
+    }
+
+    #[test]
+    fn dry_run_preview_keeps_its_keys_on_a_short_circuit() {
+        // A host whose every recommendation is filtered out short-circuits
+        // before the preview is built. Under --dry-run the answer must still
+        // carry the keys that flag promises: a script reading `would_apply`
+        // has no other way to tell "nothing to plan" from "the flag was
+        // ignored", and `would_skip` names the parameters it is missing.
+        let recs = vec![rec("vm.swappiness", false)];
+        let (blocked, code) =
+            tune_short_circuit(&recs, 0).expect("everything blocked short-circuits");
+        assert_eq!(code, 1);
+
+        let preview = dry_run_preview(blocked, &recs);
+        assert_eq!(preview["dry_run"], json!(true));
+        assert_eq!(preview["would_apply"], json!([]));
+        assert_eq!(
+            preview["would_skip"],
+            json!([{ "param": "vm.swappiness", "reason": "unwritable" }])
+        );
+        // `blocked` stays the skip-list count on every dry-run shape, the way
+        // the planned shape already reports it: a script reading the key must
+        // not see it vanish exactly on the host where everything is blocked.
+        assert_eq!(preview["blocked"], json!(1));
+        // The short-circuit vocabulary and its counts are untouched.
+        assert_eq!(preview["status"], json!("blocked"));
+        assert_eq!(preview["recommendations"], json!(1));
+        assert_eq!(preview["blocked_unwritable"], json!(1));
+
+        // The truly-optimal body takes the same keys, with an empty list.
+        let (optimal, code) = tune_short_circuit(&[], 0).expect("nothing to recommend");
+        assert_eq!(code, 0);
+        let preview = dry_run_preview(optimal, &[]);
+        assert_eq!(preview["dry_run"], json!(true));
+        assert_eq!(preview["would_apply"], json!([]));
+        assert_eq!(preview["would_skip"], json!([]));
+        assert_eq!(preview["blocked"], json!(0));
+        assert_eq!(preview["status"], json!("optimal"));
     }
 
     #[test]
@@ -527,18 +1075,19 @@ mod tests {
         // must serialize identically: rec_json used to drop subcategory and
         // writable from the preview, so an agent reconciling the plan
         // against the diagnosis saw the same param under two schemas
-        // (6 keys vs the documented 8).
-        let output = dry_run_output(
-            &[rec("vm.swappiness", true), rec("net.core.somaxconn", false)],
-            2,
-        );
+        // (6 keys vs the documented 8). The fixture is plan-consistent —
+        // would_apply only ever lists applicable entries, so none of them
+        // carries a skip_reason; the skipped-entry shape is covered by
+        // check_entries_carry_the_reason_the_plan_skips_them.
+        let recs = vec![rec("vm.swappiness", true), rec("net.core.somaxconn", true)];
+        let output = dry_run_output(&recs, &recs);
         let entries = output["would_apply"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
         // The recovered fields carry real values, not nulls.
         assert_eq!(entries[0].get("subcategory"), Some(&json!("memory")));
         assert_eq!(entries[0].get("writable"), Some(&json!(true)));
         assert_eq!(entries[1].get("subcategory"), Some(&json!("network")));
-        assert_eq!(entries[1].get("writable"), Some(&json!(false)));
+        assert_eq!(entries[1].get("writable"), Some(&json!(true)));
         // cmd_check builds its recommendations array with the same rec_json,
         // so the key set below is exactly check's entry shape, not a subset.
         for entry in entries {
@@ -563,6 +1112,61 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn check_entries_carry_the_reason_the_plan_skips_them() {
+        // check's recommendations are the diagnosis the plan is reconciled
+        // against — #6288's rationale applies here word for word:
+        // `writable: true` on vm.nr_hugepages with no reason told the agent
+        // the opposite of what every apply path does (tune skips it, fix
+        // refuses it). The reason must ride the shared entry shape, not
+        // `why`'s bespoke output alone.
+        let recs = vec![
+            rec("vm.nr_hugepages", true), // writable, runtime-dangerous
+            rec("vm.swappiness", false),  // unwritable in this environment
+            rec("fs.file-max", true),     // applicable: no reason to carry
+        ];
+        let entries: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
+        assert_eq!(
+            entries[0]["skip_reason"],
+            json!("runtime_dangerous"),
+            "a writable runtime-dangerous entry names why the plan drops it"
+        );
+        assert_eq!(entries[1]["skip_reason"], json!("unwritable"));
+        assert!(
+            entries[2].get("skip_reason").is_none(),
+            "an entry the plan writes carries no skip reason"
+        );
+    }
+
+    #[test]
+    fn predicted_score_ignores_the_entries_the_plan_skips() {
+        // The prediction is the score after TUNING, and tuning here is the
+        // plan: `tune` skips vm.nr_hugepages (runtime-dangerous) and every
+        // unwritable entry, `fix` refuses both. Counting them promised points
+        // no write path delivers — on a container whose /proc/sys is
+        // read-only, `check` reported the fully tuned score while
+        // `tune --dry-run` answered "blocked" and a real tune applied 0.
+        let view = vec![
+            rec("vm.nr_hugepages", true), // writable but runtime-dangerous
+            rec("vm.swappiness", false),  // unwritable
+            rec("fs.file-max", true),     // applicable: the only plan entry
+        ];
+        let eval = evaluation(view.clone());
+        // Only fs.file-max's penalty (3) comes off: the two skipped entries
+        // keep theirs, so the plan reaches 94, not 100.
+        assert_eq!(predicted_score(&eval, &view), 94);
+
+        // A fully blocked plan delivers nothing, so the prediction is the
+        // score the host already has — never the tuned score.
+        let blocked = vec![rec("vm.swappiness", false), rec("vm.nr_hugepages", true)];
+        let eval = evaluation(blocked.clone());
+        assert_eq!(predicted_score(&eval, &blocked), eval.score());
+        assert!(
+            predicted_score(&eval, &blocked) < 100,
+            "a blocked plan must not promise the tuned score"
+        );
     }
 
     #[test]
@@ -659,21 +1263,29 @@ mod tests {
     #[test]
     fn why_reads_sysfs_fallback_without_rewriting_identity() {
         let eval = evaluation(Vec::new());
-        for (param, path, value) in [
+        // The fallback reports the VALUE, not the file's rendering: the
+        // parameter is bracketed option lists, and `current` must be the
+        // active option — the format `check`, a recommendation's `current`
+        // and the ledger's recorded original all use, so the field does not
+        // flip when the recommendation disappears.
+        for (param, path, value, active) in [
             (
                 "transparent_hugepage/enabled",
                 "/sys/kernel/mm/transparent_hugepage/enabled",
                 "always [madvise] never\n",
+                "madvise",
             ),
             (
                 "transparent_hugepage/defrag",
                 "/sys/kernel/mm/transparent_hugepage/defrag",
                 "always defer defer+madvise [madvise] never\n",
+                "madvise",
             ),
             (
                 "block/Disk.0/scheduler",
                 "/sys/block/Disk.0/queue/scheduler",
                 "[none] mq-deadline\n",
+                "none",
             ),
         ] {
             let current = CurrentFile::new(value);
@@ -683,7 +1295,7 @@ mod tests {
             assert_eq!(code, 0);
             assert_eq!(
                 output,
-                json!({ "param": param, "current": value.trim(), "status": "optimal" })
+                json!({ "param": param, "current": active, "status": "optimal" })
             );
         }
     }
@@ -708,6 +1320,50 @@ mod tests {
                 json!({ "param": "kernel.ostype", "current": "Linux", "status": "optimal" })
             );
         }
+    }
+
+    #[test]
+    fn why_reports_one_value_format_for_a_multi_value_knob() {
+        // The recommendation branch publishes the rules' reading, which
+        // collapses the kernel's field separators to single spaces
+        // (read_sysctl_string). The fallback branch reads the file itself,
+        // and the kernel separates the fields of net.ipv4.tcp_rmem /
+        // kernel.sem with TABs: publishing that raw line flipped the format
+        // of `current` exactly when the recommendation disappeared — the same
+        // flip the bracketed option lists used to have — so an agent polling
+        // `why` saw "4096 131072 6291456" turn into
+        // "4096\t131072\t6291456".
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("4096\t131072\t6291456\n");
+        let (output, code) = why_with("net.ipv4.tcp_rmem", &eval, |path| {
+            Ok(current.read_for(path, "/proc/sys/net/ipv4/tcp_rmem"))
+        })
+        .expect("a readable parameter without a recommendation");
+        assert_eq!(code, 0);
+        assert_eq!(
+            output,
+            json!({
+                "param": "net.ipv4.tcp_rmem",
+                "current": "4096 131072 6291456",
+                "status": "optimal"
+            })
+        );
+        // The recommendation branch reports the same knob in the same
+        // format, so the two branches cannot disagree about the value.
+        let eval = evaluation(vec![Recommendation {
+            param: "net.ipv4.tcp_rmem".to_string(),
+            current_value: "4096 131072 6291456".to_string(),
+            recommended_value: "4096 87380 16777216".to_string(),
+            reason: "existing reason".to_string(),
+            writable: true,
+            ..Default::default()
+        }]);
+        let (with_rec, code) = why_with("net.ipv4.tcp_rmem", &eval, |_| {
+            panic!("a recommendation must not fall through to a filesystem read")
+        })
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(with_rec["current"], output["current"]);
     }
 
     #[test]
@@ -749,6 +1405,46 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn why_names_the_reason_the_plan_skips_a_recommendation() {
+        // The same classification the plan publishes (#6134's would_skip): a
+        // recommendation `why` explains can be one no write path will ever
+        // take. `writable: true` on vm.nr_hugepages without the skip reason
+        // told an agent the opposite of what every apply path does — tune
+        // skips it (would_skip names it runtime_dangerous) and fix refuses it
+        // outright — so the explanation command must carry the reason too.
+        let eval = evaluation(vec![
+            rec("vm.nr_hugepages", true),
+            rec("vm.swappiness", false),
+        ]);
+        let (output, code) = why_with("vm.nr_hugepages", &eval, |_| {
+            panic!("a recommendation must not fall through to a filesystem read")
+        })
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(output["skip_reason"], json!("runtime_dangerous"));
+        assert_eq!(output["writable"], json!(true));
+
+        let (output, _) = why_with("vm.swappiness", &eval, |_| {
+            panic!("a recommendation must not fall through to a filesystem read")
+        })
+        .unwrap();
+        assert_eq!(output["skip_reason"], json!("unwritable"));
+        assert_eq!(output["writable"], json!(false));
+
+        // An applicable recommendation carries no skip reason: the plan will
+        // write it, so there is nothing to explain away.
+        let eval = evaluation(vec![rec("fs.file-max", true)]);
+        let (output, _) = why_with("fs.file-max", &eval, |_| {
+            panic!("a recommendation must not fall through to a filesystem read")
+        })
+        .unwrap();
+        assert!(
+            output.get("skip_reason").is_none(),
+            "an applicable entry must not claim a skip reason: {output}"
+        );
     }
 
     #[test]

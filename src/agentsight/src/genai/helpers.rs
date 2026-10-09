@@ -40,16 +40,18 @@ impl CallKind {
 /// their prompts, these patterns may need extending. Consider moving to
 /// config-driven rules if the list grows beyond a handful of agents.
 pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
-    // Collect system instructions text
+    // Collect system instructions text from *every* part of every system
+    // message: the request view keeps wire order, so a prompt that arrives as
+    // several blocks (Anthropic's `system` array, the Responses API's
+    // `instructions` plus a system item) spreads its text over the message's
+    // parts. The raw path reads the same content and its doc requires both
+    // paths to extract the same text.
     let system_text: String = request
         .messages
         .iter()
         .filter(|m| m.role == "system")
-        .filter_map(|m| m.parts.first())
-        .filter_map(|p| match p {
-            MessagePart::Text { content } => Some(content.as_str()),
-            _ => None,
-        })
+        .map(|m| GenAIBuilder::joined_text_parts(&m.parts))
+        .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -71,19 +73,17 @@ pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
         }
     }
 
-    // ② Check first-user text (Claude Code patterns + Cosh tool-output)
-    let first_user_text: Option<&str> = request
-        .messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .filter_map(|m| m.parts.first())
-        .filter_map(|p| match p {
-            MessagePart::Text { content } => Some(content.as_str()),
-            _ => None,
-        })
-        .next();
+    // ② Check first-user text (Claude Code patterns + Cosh tool-output).
+    //
+    // Reuse the walk the session key already uses: it skips a tool-result-only
+    // turn and joins every text part of the turn it picks. Reading only
+    // `parts.first()` lost the text of the mixed shape the request view builds
+    // in wire order — `[tool_result, text]` — so a recap nudge or a web search
+    // that arrives with a tool result classified as `main`, which is what the
+    // preference window and the non-auxiliary session views select on.
+    let first_user_text = GenAIBuilder::extract_first_user_raw(request);
 
-    if let Some(text) = first_user_text {
+    if let Some(text) = first_user_text.as_deref() {
         // Cosh tool-output + Claude Code recap (both → Recap)
         if text.starts_with("Summarize the following tool output to be a maximum of")
             || (text
@@ -227,45 +227,6 @@ static OPENCLAW_TS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::
 });
 
 impl GenAIBuilder {
-    /// Path suffixes of the DashScope/Bailian **native** protocol.
-    ///
-    /// Full form: `POST https://{WorkspaceId}.{region}.maas.aliyuncs.com
-    /// /api/v1/services/aigc/{text,multimodal}-generation/generation`.
-    /// Distinct from the OpenAI-compatible mode
-    /// (`/compatible-mode/v1/chat/completions`), which already matches the
-    /// `/v1/chat/completions` pattern.
-    pub(super) const DASHSCOPE_NATIVE_PATHS: [&'static str; 2] = [
-        "/aigc/text-generation/generation",
-        "/aigc/multimodal-generation/generation",
-    ];
-
-    /// Whether the path belongs to the DashScope/Bailian native protocol.
-    pub(super) fn is_dashscope_native_path(path: &str) -> bool {
-        Self::DASHSCOPE_NATIVE_PATHS
-            .iter()
-            .any(|p| path.contains(p))
-    }
-
-    /// Check if the path indicates an LLM API call
-    pub(super) fn is_llm_api_path(&self, path: &str) -> bool {
-        path.contains("/v1/chat/completions")
-            || path.contains("/v1/completions")
-            // Anthropic's /v1/messages/count_tokens (token counting) and
-            // /v1/messages/batches* (Batch API) share the inference prefix
-            // but are not inference calls; the OpenAI arms have no such
-            // sub-endpoints. Must stay in lockstep with
-            // AnthropicParser::matches_path so a count-tokens call neither
-            // creates a row (this gate) nor gets deep-parsed (that gate).
-            || (path.contains("/v1/messages")
-                && !path.contains("/v1/messages/count_tokens")
-                && !path.contains("/v1/messages/batches"))
-            || path.contains("/v1/responses")
-            || path.contains("/chat/completions")
-            || path.contains("/completions")
-            || path.contains("/api/v1/copilot/generate_copilot")
-            || Self::is_dashscope_native_path(path)
-    }
-
     /// Check if request body contains SysOM POP API markers
     /// SysOM uses path "/" with action in body (llmParamString field)
     pub(super) fn is_sysom_pop_request(request_body: &Option<String>) -> bool {
@@ -273,91 +234,6 @@ impl GenAIBuilder {
             .as_ref()
             .map(|b| b.contains("llmParamString"))
             .unwrap_or(false)
-    }
-
-    /// Normalize the messages array from a parsed request body.
-    ///
-    /// Supports:
-    /// - OpenAI chat completions: top-level `"messages"` array.
-    /// - OpenAI Responses API (codex 0.137+ via dashscope `/v1/responses`):
-    ///   top-level `"input"` array with sibling `"instructions"` string.
-    /// - OpenAI Responses API string shorthand: top-level `"input"` as a
-    ///   plain non-empty string, equivalent to a single-user-message
-    ///   request.
-    /// - DashScope/Bailian native protocol: top-level `"input"` **object**
-    ///   wrapping a `"messages"` array.
-    ///
-    /// Returns `(messages_vec, instructions_text)` where `instructions_text`
-    /// is the system-prompt fallback used when the messages array has no
-    /// `role == "system"` entry. It is set for:
-    /// - OpenAI Responses API: the top-level `"instructions"` string.
-    /// - Anthropic Messages API: the top-level `"system"` field (string or
-    ///   array of `{"type":"text","text":"..."}` blocks), since Anthropic
-    ///   carries the system prompt outside the messages array.
-    ///
-    /// The native protocol needs no fallback: its system prompt lives inside
-    /// `input.messages`.
-    pub(crate) fn extract_messages_view(
-        body: &serde_json::Value,
-    ) -> Option<(Vec<serde_json::Value>, Option<String>)> {
-        if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
-            let system_text = body.get("system").and_then(Self::extract_system_text);
-            return Some((arr.clone(), system_text));
-        }
-        if let Some(input) = body.get("input") {
-            if let Some(arr) = input.as_array() {
-                let instructions = body
-                    .get("instructions")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                return Some((arr.clone(), instructions));
-            }
-            // OpenAI Responses API string shorthand: `"input": "<text>"` is
-            // defined as a request with exactly one user message carrying
-            // that text. Map it onto that message so the request event is
-            // not silently skipped from the breakdown. An empty string
-            // carries no message: fall through to `None` as before.
-            if let Some(s) = input.as_str().filter(|s| !s.is_empty()) {
-                let instructions = body
-                    .get("instructions")
-                    .and_then(|i| i.as_str())
-                    .map(|i| i.to_string());
-                return Some((
-                    vec![serde_json::json!({"role": "user", "content": s})],
-                    instructions,
-                ));
-            }
-            if let Some(arr) = input.get("messages").and_then(|m| m.as_array()) {
-                return Some((arr.clone(), None));
-            }
-        }
-        None
-    }
-
-    /// Extract text from Anthropic's top-level `system` field.
-    ///
-    /// The field is either a plain string or an array of content blocks
-    /// (`{"type":"text","text":"..."}`). Returns `None` when empty so the
-    /// caller's "no system role in messages" fallback stays inactive.
-    fn extract_system_text(system: &serde_json::Value) -> Option<String> {
-        match system {
-            serde_json::Value::String(s) => {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.clone())
-                }
-            }
-            serde_json::Value::Array(blocks) => {
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.is_empty() { None } else { Some(text) }
-            }
-            _ => None,
-        }
     }
 
     /// Extract human-readable text from a message's `content` field.
@@ -393,7 +269,17 @@ impl GenAIBuilder {
         None
     }
 
-    /// Extract provider from path
+    /// Extract provider from path.
+    ///
+    /// The path is the most specific source the genai call has: a Gemini
+    /// generation call carries neither a `model` field in its body nor (on the
+    /// audit side) a token record, and the shared LLM gate already admits the
+    /// path as a call (`parser::llm::is_llm_api_path` gained the same
+    /// `:generateContent` actions in 8d77de789). Without this branch the row
+    /// fell through to the token record and, when there was none, was recorded
+    /// as provider `unknown` — while the audit labels the same path `gemini`
+    /// through `MessageParser::detect_provider`, so one call had two
+    /// identities.
     pub(super) fn extract_provider_from_path(&self, path: &str) -> Option<String> {
         if path.contains("anthropic") || path.contains("/v1/messages") {
             Some("anthropic".to_string())
@@ -404,8 +290,14 @@ impl GenAIBuilder {
             Some("openai".to_string())
         } else if path.contains("/api/v1/copilot/generate_copilot") {
             Some("sysom".to_string())
-        } else if Self::is_dashscope_native_path(path) {
+        } else if crate::parser::llm::is_dashscope_native_path(path) {
             Some("dashscope".to_string())
+        } else if crate::analyzer::message::MessageParser::gemini_model_from_path(path).is_some() {
+            // The model rides in the path for Gemini's inference actions, so a
+            // path that names one is a Gemini generation call (`:countTokens`
+            // returns `None` there and stays out, like every other
+            // token-counting sub-endpoint).
+            Some("gemini".to_string())
         } else {
             None
         }
@@ -493,6 +385,24 @@ impl GenAIBuilder {
         None
     }
 
+    /// Join the non-empty `Text` parts of a message, in wire order.
+    ///
+    /// The request view keeps wire order, so a message that arrived as several
+    /// blocks — or as `[tool_result, text]` — carries its text across parts.
+    /// Every reader that wants "the text of this message" must join them all;
+    /// a `parts.first()` read loses the mixed shapes (and made the classifier
+    /// disagree with the raw/pending path for them).
+    fn joined_text_parts(parts: &[MessagePart]) -> String {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Text { content } if !content.is_empty() => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// 提取第一条有实际文本内容的 user message 的原始文本
     ///
     /// 仅返回含非空 `Text` 片段的首条 user message，供 `IdResolver`
@@ -502,20 +412,8 @@ impl GenAIBuilder {
             .messages
             .iter()
             .filter(|m| m.role == "user")
-            .find_map(|m| {
-                let text: String = m
-                    .parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        MessagePart::Text { content } if !content.is_empty() => {
-                            Some(content.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.is_empty() { None } else { Some(text) }
-            })
+            .map(|m| Self::joined_text_parts(&m.parts))
+            .find(|text| !text.is_empty())
     }
 
     /// 提取最后一条有实际文本内容的 user message 的原始文本
@@ -527,20 +425,8 @@ impl GenAIBuilder {
             .iter()
             .rev()
             .filter(|m| m.role == "user")
-            .find_map(|m| {
-                let text: String = m
-                    .parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        MessagePart::Text { content } if !content.is_empty() => {
-                            Some(content.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.is_empty() { None } else { Some(text) }
-            })
+            .map(|m| Self::joined_text_parts(&m.parts))
+            .find(|text| !text.is_empty())
     }
 
     /// 统计请求中"真正的用户消息"条数：role=user 且包含至少一个非空 Text 部分。
@@ -877,47 +763,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_llm_api_path() {
-        let builder = GenAIBuilder::new();
-        assert!(builder.is_llm_api_path("/v1/chat/completions"));
-        assert!(builder.is_llm_api_path("/v1/completions"));
-        assert!(builder.is_llm_api_path("/v1/messages"));
-        assert!(builder.is_llm_api_path("/api/v1/copilot/generate_copilot"));
-        assert!(builder.is_llm_api_path("/proxy/v1/chat/completions"));
-        assert!(!builder.is_llm_api_path("/api/health"));
-        assert!(!builder.is_llm_api_path("/v1/models"));
-    }
-
-    /// Anthropic's count-tokens and Batch sub-endpoints share the inference
-    /// prefix but are not inference calls — admitting them at this gate
-    /// creates a phantom llm_call row per count (same conversation_id, zero
-    /// tokens, no output) that inflates call counts and consumes
-    /// preference-window slots.
-    #[test]
-    fn test_is_llm_api_path_rejects_anthropic_sub_endpoints() {
-        let builder = GenAIBuilder::new();
-        assert!(!builder.is_llm_api_path("/v1/messages/count_tokens"));
-        assert!(!builder.is_llm_api_path("https://api.anthropic.com/v1/messages/count_tokens"));
-        assert!(!builder.is_llm_api_path("/v1/messages/batches"));
-        assert!(!builder.is_llm_api_path("/v1/messages/batches/msgbatch_01ABC"));
-        // The real endpoint still passes the gate.
-        assert!(builder.is_llm_api_path("/v1/messages"));
-        assert!(builder.is_llm_api_path("https://api.anthropic.com/v1/messages"));
-    }
-
-    /// DashScope/Bailian native protocol endpoints end in `/generation`, which
-    /// matched none of the compatible-mode patterns. Without them the whole
-    /// non-streaming call was dropped at the `build_llm_call` gate.
-    #[test]
-    fn test_is_llm_api_path_dashscope_native() {
-        let builder = GenAIBuilder::new();
-        assert!(builder.is_llm_api_path("/api/v1/services/aigc/text-generation/generation"));
-        assert!(builder.is_llm_api_path("/api/v1/services/aigc/multimodal-generation/generation"));
-        // Other aigc services (image synthesis, embeddings) stay out.
-        assert!(!builder.is_llm_api_path("/api/v1/services/aigc/text2image/image-synthesis"));
-    }
-
-    #[test]
     fn test_is_sysom_pop_request() {
         assert!(GenAIBuilder::is_sysom_pop_request(&Some(
             r#"{"llmParamString":"{}"}"#.to_string()
@@ -964,6 +809,35 @@ mod tests {
             builder.extract_provider_from_path("/compatible-mode/v1/chat/completions"),
             Some("openai".to_string())
         );
+    }
+
+    /// Gemini's generation actions carry the model in the path while the body
+    /// holds only `contents`/`generationConfig`, so a call whose usage was not
+    /// parsed had no source left: it fell through the token record to
+    /// `unknown`, while the audit labels the same path `gemini` through
+    /// `MessageParser::detect_provider`.
+    #[test]
+    fn test_extract_provider_from_path_gemini_generation() {
+        let builder = GenAIBuilder::new();
+        for path in [
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            "/v1/projects/p/locations/l/publishers/google/models/gemini-2.5-pro:generateContent",
+        ] {
+            assert_eq!(
+                builder.extract_provider_from_path(path),
+                Some("gemini".to_string()),
+                "{path}"
+            );
+        }
+        // Token counting shares the prefix but is not an inference call, and a
+        // bare models path names no action at all.
+        assert_eq!(
+            builder.extract_provider_from_path("/v1beta/models/gemini-2.5-pro:countTokens"),
+            None
+        );
+        assert_eq!(builder.extract_provider_from_path("/v1beta/models"), None);
     }
 
     #[test]
@@ -1551,6 +1425,82 @@ mod tests {
         assert_eq!(classify_call_kind(&req), CallKind::Main);
     }
 
+    /// A message can carry more than one part, and the request view pushes them
+    /// in wire order: an Anthropic-style user turn of `[tool_result, text]`
+    /// puts the text *after* the tool result.
+    ///
+    /// The classifier read only `parts.first()`, so a recap nudge or a web
+    /// search query arriving in such a turn was invisible: the call was
+    /// classified `main` and entered the `call_kind = 'main'` consumers (the
+    /// preference window, and the session/trace views that skip auxiliary
+    /// calls) as a user session. Its siblings read every part —
+    /// `extract_first_user_raw`, and `classify_call_kind_from_raw`, whose doc
+    /// requires both paths to extract the same text — so the same call had two
+    /// classifications depending on which one ran.
+    #[test]
+    fn test_classify_reads_every_text_part_not_only_the_first() {
+        // Tool result first, then the recap instruction (wire order).
+        let req = make_llm_request(vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![
+                MessagePart::ToolCallResponse {
+                    id: Some("tc-1".to_string()),
+                    response: serde_json::json!({"result": "ok"}),
+                },
+                MessagePart::Text {
+                    content: "Summarize the following tool output to be a maximum of 400 tokens"
+                        .to_string(),
+                },
+            ],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::Recap);
+
+        // The web-search query rides in the same shape.
+        let req = make_llm_request(vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![
+                MessagePart::ToolCallResponse {
+                    id: None,
+                    response: serde_json::json!({}),
+                },
+                MessagePart::Text {
+                    content: "Perform a web search for the query: rust lifetimes".to_string(),
+                },
+            ],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::WebSearch);
+
+        // A system prompt split across blocks: the marker sits in the second.
+        let req = make_llm_request(vec![InputMessage {
+            role: "system".to_string(),
+            parts: vec![
+                MessagePart::Text {
+                    content: "You are a helpful assistant.".to_string(),
+                },
+                MessagePart::Text {
+                    content: "You are a specialized context summarizer for project files"
+                        .to_string(),
+                },
+            ],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::Recap);
+
+        // Guard: a tool-result-only turn (no text) still classifies Main, the
+        // same shape `extract_first_user_raw` documents as skippable.
+        let req = make_llm_request(vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![MessagePart::ToolCallResponse {
+                id: Some("tc-2".to_string()),
+                response: serde_json::json!({"result": "ok"}),
+            }],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::Main);
+    }
+
     #[test]
     fn test_extract_model_from_message() {
         let builder = GenAIBuilder::new();
@@ -1582,194 +1532,6 @@ mod tests {
             Some("gpt-4-turbo".to_string())
         );
         assert_eq!(builder.extract_model_from_message(&None), None);
-    }
-
-    #[test]
-    fn test_extract_messages_view_chat_completions() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "sys"},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert!(instructions.is_none());
-    }
-
-    #[test]
-    fn test_extract_messages_view_responses_api() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "input": [{"role": "user", "content": "hi"}],
-            "instructions": "sys prompt"
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(instructions.as_deref(), Some("sys prompt"));
-    }
-
-    #[test]
-    fn test_extract_messages_view_none() {
-        let body = serde_json::json!({"model": "gpt-4"});
-        assert!(GenAIBuilder::extract_messages_view(&body).is_none());
-    }
-
-    #[test]
-    fn test_extract_messages_view_responses_api_without_instructions() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "input": [{"role": "user", "content": "hi"}]
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert!(instructions.is_none());
-    }
-
-    /// OpenAI Responses API string shorthand: `"input": "<string>"`
-    /// (e.g. codex CLI one-shot requests) is equivalent to a single
-    /// user message and must yield a one-message view, not `None`.
-    #[test]
-    fn test_extract_messages_view_responses_api_string_input() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "input": "write a haiku",
-            "instructions": "sys prompt"
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("user"));
-        assert_eq!(
-            msgs[0].get("content").and_then(|c| c.as_str()),
-            Some("write a haiku")
-        );
-        // Instructions prepending is unchanged for the string shape.
-        assert_eq!(instructions.as_deref(), Some("sys prompt"));
-    }
-
-    #[test]
-    fn test_extract_messages_view_responses_api_string_input_without_instructions() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "input": "write a haiku"
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("user"));
-        assert!(instructions.is_none());
-    }
-
-    /// An empty string is the only falsy shape of the string shorthand:
-    /// it carries no message, so the view stays `None` as before.
-    #[test]
-    fn test_extract_messages_view_responses_api_empty_string_input() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "input": ""
-        });
-        assert!(GenAIBuilder::extract_messages_view(&body).is_none());
-    }
-
-    #[test]
-    fn test_extract_system_text_string() {
-        let system = serde_json::json!("You are helpful");
-        assert_eq!(
-            GenAIBuilder::extract_system_text(&system),
-            Some("You are helpful".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_system_text_empty_string() {
-        let system = serde_json::json!("");
-        assert_eq!(GenAIBuilder::extract_system_text(&system), None);
-    }
-
-    #[test]
-    fn test_extract_system_text_array() {
-        let system = serde_json::json!([
-            {"type": "text", "text": "Part 1"},
-            {"type": "text", "text": "Part 2"}
-        ]);
-        assert_eq!(
-            GenAIBuilder::extract_system_text(&system),
-            Some("Part 1\nPart 2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_system_text_empty_array() {
-        let system = serde_json::json!([]);
-        assert_eq!(GenAIBuilder::extract_system_text(&system), None);
-    }
-
-    #[test]
-    fn test_extract_system_text_non_text() {
-        assert_eq!(
-            GenAIBuilder::extract_system_text(&serde_json::json!(123)),
-            None
-        );
-        assert_eq!(
-            GenAIBuilder::extract_system_text(&serde_json::Value::Null),
-            None
-        );
-    }
-
-    /// DashScope/Bailian native protocol wraps the messages array inside an
-    /// `input` **object**, unlike the Responses API where `input` is an array.
-    #[test]
-    fn test_extract_messages_view_dashscope_native_input_object() {
-        let body = serde_json::json!({
-            "model": "qwen-plus",
-            "input": {
-                "messages": [
-                    {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "hi"}
-                ]
-            },
-            "parameters": {"result_format": "message"}
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("system"));
-        // Native protocol carries the system prompt inside the messages array,
-        // so no top-level instructions fallback is needed.
-        assert!(instructions.is_none());
-    }
-
-    /// An `input` object without a `messages` array carries no conversation.
-    #[test]
-    fn test_extract_messages_view_dashscope_native_input_object_without_messages() {
-        let body = serde_json::json!({
-            "model": "qwen-plus",
-            "input": {"prompt": "hi"}
-        });
-        assert!(GenAIBuilder::extract_messages_view(&body).is_none());
-    }
-
-    #[test]
-    fn test_extract_messages_view_anthropic_system() {
-        let body = serde_json::json!({
-            "model": "claude-3",
-            "system": "You are helpful",
-            "messages": [{"role": "user", "content": "Hi"}]
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(instructions.as_deref(), Some("You are helpful"));
-    }
-
-    #[test]
-    fn test_extract_messages_view_anthropic_system_array() {
-        let body = serde_json::json!({
-            "model": "claude-3",
-            "system": [{"type": "text", "text": "sys prompt"}],
-            "messages": [{"role": "user", "content": "Hi"}]
-        });
-        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(instructions.as_deref(), Some("sys prompt"));
     }
 
     #[test]

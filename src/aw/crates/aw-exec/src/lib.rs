@@ -123,7 +123,9 @@ pub enum Error {
 /// scheduling. They must leave child reaping to this function (no competing
 /// wait or automatic SIGCHLD reaping). This is process hygiene, not a sandbox:
 /// descendants can escape the group, and kernel-blocked calls are not hard
-/// realtime bounded. A forcibly terminated caller cannot perform cleanup.
+/// realtime bounded. Linux kills the immediate child if its owning thread dies;
+/// a forcibly terminated caller still cannot verify or clean up descendants.
+/// Privilege-changing executables can clear that parent-death signal.
 ///
 /// # Errors
 /// Returns typed errors for cancellation, deadline, stream limits, spawn/pipe
@@ -143,6 +145,32 @@ pub fn run(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (command, input, limits, deadline, cancelled);
+        Err(Error::UnsupportedPlatform)
+    }
+}
+
+/// Run an Agent with inherited terminal streams and exclusive process-group ownership.
+///
+/// The session lasts until the child exits or the caller supplies a termination
+/// signal. Pending signals are forwarded to the owned group; termination then
+/// has a two-second grace period. The foreground terminal is restored and owned
+/// descendants are stopped before returning the original child exit status.
+/// The caller must serialize foreground sessions and own signal-handler setup.
+/// This is foreground execution, not a shell job-control implementation.
+///
+/// # Errors
+/// Rejects spawn, terminal-transfer, child-wait and bounded cleanup failures.
+pub fn run_foreground(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+) -> Result<ExitStatus, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::foreground::run(command, signal)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, signal);
         Err(Error::UnsupportedPlatform)
     }
 }

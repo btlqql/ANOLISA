@@ -3,9 +3,11 @@
 mod binding;
 mod capabilities;
 mod common;
+mod observability;
 mod policy;
 mod scan_code;
 mod scan_pii;
+mod scan_prompt;
 mod scope;
 mod skill_ledger;
 
@@ -18,11 +20,16 @@ use self::policy::PolicyCommand;
 use self::scan_code::ScanCodeCommand;
 pub use self::scan_pii::PiiOutputFormat;
 use self::scan_pii::ScanPiiCommand;
+use self::scan_prompt::ScanPromptCommand;
+pub use self::scan_prompt::{PromptScanPlan, ScanPromptInputError};
 use self::scope::ScopeCommand;
 use crate::InputError;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Collect observability records through the daemon.
+    #[command(subcommand)]
+    Observability(observability::ObservabilityCommand),
     /// Manage authored Policy templates.
     #[command(subcommand)]
     Policy(PolicyCommand),
@@ -36,6 +43,8 @@ pub(crate) enum Command {
     ScanCode(ScanCodeCommand),
     /// Detect PII and credentials through the daemon.
     ScanPii(ScanPiiCommand),
+    /// Scan a prompt for injection or jailbreak attempts.
+    ScanPrompt(ScanPromptCommand),
     /// Manage Skill scanning, signatures, history and activation.
     #[command(subcommand)]
     SkillLedger(skill_ledger::SkillLedgerCommand),
@@ -46,11 +55,15 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn request(&self) -> Result<DaemonRequest, InputError> {
         match self {
+            Self::Observability(command) => command.request(),
             Self::Policy(command) => command.request(),
             Self::Scope(command) => command.request(),
             Self::Binding(command) => command.request(),
             Self::ScanCode(command) => command.request(),
             Self::ScanPii(command) => command.request(),
+            // Scan-prompt resolves its own request batch (it may read stdin
+            // or a batch file), so the single-request path refuses it.
+            Self::ScanPrompt(_) => Err(InputError::PromptScanBatch),
             Self::Capabilities(_) => Err(InputError::LocalCommand),
             Self::SkillLedger(command) => command.request(),
         }
@@ -66,8 +79,28 @@ impl Command {
         }
     }
 
+    pub(crate) fn prompt_scan_run(&self) -> Result<scan_prompt::PromptScanPlan, InputError> {
+        match self {
+            Self::ScanPrompt(command) => command.plan().map_err(InputError::from),
+            // The plan resolves stdin and input files before any transport,
+            // so only the scan-prompt command has one.
+            _ => Err(InputError::LocalCommand),
+        }
+    }
+
+    pub(crate) const fn is_observability_record(&self) -> bool {
+        matches!(
+            self,
+            Self::Observability(observability::ObservabilityCommand::Record(_))
+        )
+    }
+
     pub(crate) const fn is_scan_code(&self) -> bool {
         matches!(self, Self::ScanCode(_))
+    }
+
+    pub(crate) fn is_llm_code_scan(&self) -> bool {
+        matches!(self, Self::ScanCode(command) if command.is_llm_mode())
     }
 
     pub(crate) const fn pii_format(&self) -> Option<PiiOutputFormat> {
@@ -75,6 +108,10 @@ impl Command {
             Self::ScanPii(command) => Some(command.format),
             _ => None,
         }
+    }
+
+    pub(crate) const fn is_scan_prompt(&self) -> bool {
+        matches!(self, Self::ScanPrompt(_))
     }
 
     /// Returns the command when it runs locally instead of through the daemon.

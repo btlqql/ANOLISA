@@ -482,10 +482,42 @@ fn scenario_probe_result_still_counts_as_evidence() {
     );
 }
 
+#[test]
+fn scenario_successful_listing_of_the_path_is_evidence() {
+    // A successful listing answers its own argument, so the first result line
+    // is a real observation, not a command echo. The guard used to drop any
+    // leading line the command *contains*, which deleted this one: the claim
+    // about the inspected path then read as Unresolved and could turn into an
+    // ungrounded-onset finding.
+    let doc = traj(vec![
+        user(1, "日志在吗"),
+        acting_agent(
+            2,
+            "检查",
+            vec![call(
+                "c1",
+                "Bash",
+                serde_json::json!({"command": "ls /var/log/app.log"}),
+            )],
+            vec![ok_result("c1", "/var/log/app.log")],
+        ),
+        agent(3, "/var/log/app.log 存在。"),
+    ]);
+    let index = index_of(&doc);
+
+    assert!(
+        matches!(
+            grounding_for(&index, "/var/log/app.log"),
+            Grounding::Grounded { .. }
+        ),
+        "a successful listing is its own observation: {:?}",
+        index.claims
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 13..14 — abstention input and blame scoping
 // ---------------------------------------------------------------------------
-
 #[test]
 fn scenario_unlinked_calls_drive_the_unknown_ratio() {
     let doc = traj(vec![
@@ -681,6 +713,36 @@ fn evidence_digest_carries_what_the_rules_used() {
     assert!(
         index.evidence_digest.contains("读一下配置"),
         "including the user's own words"
+    );
+}
+
+/// The digest budget is a byte budget — that is what the prompt costs and what
+/// the constant documents — but the per-entry cut was taken in
+/// `chars().take(remaining)`, spending up to three bytes per character. A round
+/// whose observations are Chinese therefore handed the review roughly three
+/// times the documented bound, on a call paid for by the byte.
+#[test]
+fn the_evidence_digest_stays_inside_its_byte_budget() {
+    let entry = |step_id: usize, text: String| EvidenceEntry {
+        step_id,
+        source_call_id: None,
+        haystack: text,
+        numbers: Vec::new(),
+    };
+    let pool: Vec<EvidenceEntry> = (1..=6)
+        .map(|step| entry(step, "读取配置文件的缓冲区大小".repeat(400)))
+        .collect();
+
+    let digest = digest_pool(&pool);
+
+    assert!(
+        digest.len() <= EVIDENCE_DIGEST_LIMIT,
+        "digest is {} bytes, over the {EVIDENCE_DIGEST_LIMIT}-byte budget",
+        digest.len()
+    );
+    assert!(
+        digest.contains("读取配置文件的缓冲区大小"),
+        "the newest entry must still be carried"
     );
 }
 

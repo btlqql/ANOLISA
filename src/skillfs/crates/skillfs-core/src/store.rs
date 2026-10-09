@@ -105,17 +105,11 @@ impl SkillStore {
             // directory turns out to be a Skill or a category.
             let name = path.file_name().and_then(|n| n.to_str());
 
-            // Check max_skills limit (rough guard)
-            if loaded_count >= config.max_skills {
-                errors.push(LoadError {
-                    path: path.clone(),
-                    error: format!("max skills limit reached ({})", config.max_skills),
-                });
-                continue;
-            }
-
             if is_category_dir(&path) {
                 // ---- Categorized layout ----
+                // The max_skills limit is enforced per nested skill by
+                // `load_skills_from_category`, so the category itself is
+                // never charged a slot or an error of its own.
                 let Some(name) = name else {
                     errors.push(non_utf8_name_error(&path));
                     continue;
@@ -123,7 +117,7 @@ impl SkillStore {
                 let cat_name = name.to_string();
 
                 // Try to load _category.yaml
-                let cat_meta = load_category_meta(&path, &cat_name);
+                let cat_meta = load_category_meta(&path, &cat_name, config.max_skill_size);
                 self.categories.insert(cat_name.clone(), cat_meta);
 
                 // Load skills inside this category directory
@@ -132,7 +126,17 @@ impl SkillStore {
                 errors.extend(cat_errors);
             } else {
                 // ---- Flat layout ----
+                // Classify before enforcing the limit: a directory that is
+                // not a skill is skipped silently whether or not the limit
+                // has been reached, exactly as below the limit.
                 if !has_regular_skill_md(&path) {
+                    continue;
+                }
+                if loaded_count >= config.max_skills {
+                    errors.push(LoadError {
+                        path: path.clone(),
+                        error: format!("max skills limit reached ({})", config.max_skills),
+                    });
                     continue;
                 }
                 let Some(name) = name else {
@@ -260,15 +264,17 @@ impl SkillStore {
                 continue;
             }
 
+            // Classify before enforcing the limit: a category child that is
+            // not a skill is skipped silently whether or not the limit has
+            // been reached, exactly as below the limit.
+            if !has_regular_skill_md(&path) {
+                continue;
+            }
             if *loaded_count >= config.max_skills {
                 errors.push(LoadError {
                     path: path.clone(),
                     error: format!("max skills limit reached ({})", config.max_skills),
                 });
-                continue;
-            }
-
-            if !has_regular_skill_md(&path) {
                 continue;
             }
             // Same rule as the top-level loader: a Skill whose name is not
@@ -492,19 +498,48 @@ pub fn adopt_directory_name(entry: &mut SkillEntry, dir_name: &str) {
 
 /// Load `_category.yaml` from `dir` if present; fall back to a default meta
 /// with `name = cat_name`.
-fn load_category_meta(dir: &Path, cat_name: &str) -> CategoryMeta {
-    let yaml_path = dir.join("_category.yaml");
-    if yaml_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&yaml_path) {
-            if let Ok(meta) = serde_yaml::from_str::<CategoryMeta>(&content) {
-                return meta;
-            }
+///
+/// The file lives in the same source tree as the SKILL.md files, so the read
+/// is bounded by the same `ParseConfig` limit; a file that is not a regular
+/// file or is over the limit is treated as absent.
+fn load_category_meta(dir: &Path, cat_name: &str, max_size: usize) -> CategoryMeta {
+    if let Some(content) = read_category_yaml(&dir.join("_category.yaml"), max_size) {
+        if let Ok(meta) = serde_yaml::from_str::<CategoryMeta>(&content) {
+            return meta;
         }
     }
     CategoryMeta {
         name: cat_name.to_string(),
         description: String::new(),
     }
+}
+
+/// Read `path` as UTF-8 if it is a regular file of at most `max_size` bytes.
+///
+/// The open is non-blocking so a FIFO under this name cannot stall the load
+/// before the handle's own type is checked. A stat length is only a snapshot
+/// (the file can grow after it, and a FIFO reports 0), so the read itself is
+/// capped at `max_size + 1` bytes and an extra byte means over the limit.
+fn read_category_yaml(path: &Path, max_size: usize) -> Option<String> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(max_size as u64 + 1).read_to_end(&mut raw).ok()?;
+    if raw.len() > max_size {
+        return None;
+    }
+    String::from_utf8(raw).ok()
 }
 
 #[cfg(test)]
@@ -635,6 +670,84 @@ mod tests {
     // -----------------------------------------------------------------------
     // Load from Directory Tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn oversized_category_meta_is_treated_as_absent() {
+        // _category.yaml lives in the same agent-writable source tree as the
+        // SKILL.md files, so the read is bound by the same ParseConfig limit.
+        // A file over the limit must fall back to the default meta instead of
+        // being read whole into memory.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // A category directory carries `_category.yaml` plus one skill
+        // subdir each holding its SKILL.md.
+        let cat_dir = temp_dir.path().join("team");
+        let skill_dir = cat_dir.join("team-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let oversized = format!("name: team\ndescription: {}\n", "x".repeat(2_048));
+        std::fs::write(cat_dir.join("_category.yaml"), oversized).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: team-skill\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_024,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(errors.is_empty());
+        let meta = &store.categories["team"];
+        // Over the limit: the file is treated as absent and the default meta
+        // (name only, empty description) applies.
+        assert_eq!(meta.name, "team");
+        assert_eq!(meta.description, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_category_meta_is_treated_as_absent() {
+        // A FIFO reports length 0, so a size check alone passes it, and a
+        // blocking open/read waits for a writer that may stream without end.
+        // The load must refuse it as a non-regular file and finish.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cat_dir = temp_dir.path().join("team");
+        let skill_dir = cat_dir.join("team-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let fifo = std::ffi::CString::new(
+            cat_dir
+                .join("_category.yaml")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: team-skill\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let root = temp_dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut store = SkillStore::new();
+            let errors = store.load_from_directory(&root, &ParseConfig::default());
+            tx.send((errors.is_empty(), store.categories["team"].clone()))
+                .ok();
+        });
+
+        let (no_errors, meta) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("store load stalled on a FIFO _category.yaml");
+        assert!(no_errors);
+        assert_eq!(meta.name, "team");
+        assert_eq!(meta.description, "");
+    }
 
     #[test]
     fn test_load_from_directory_empty() {
@@ -1199,5 +1312,92 @@ mod tests {
 
         assert_eq!(primary, vec!["github".to_string(), "other".to_string()]);
         assert_eq!(secondary, vec!["notion".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // max_skills limit classification tests
+    // -----------------------------------------------------------------------
+
+    fn limit_config(max_skills: usize) -> ParseConfig {
+        ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills,
+        }
+    }
+
+    #[test]
+    fn store_max_skills_skips_non_skill_dirs_silently() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let skill = temp_dir.path().join("alpha");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: alpha\ndescription: a\n---\n",
+        )
+        .unwrap();
+        let plain = temp_dir.path().join("not-a-skill");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut store = SkillStore::new();
+        let errors = store.load_from_directory(temp_dir.path(), &limit_config(0));
+
+        // The real skill still reports the limit as before...
+        assert_eq!(errors.len(), 1, "only the skill may error, got {errors:?}");
+        assert_eq!(errors[0].path, skill);
+        assert!(
+            errors[0].error.contains("max skills"),
+            "{}",
+            errors[0].error
+        );
+        // ...but the non-skill directory is skipped silently, exactly as
+        // it is below the limit.
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn store_max_skills_charges_category_skills_once() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let nested = temp_dir.path().join("cat").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: inner\ndescription: i\n---\n",
+        )
+        .unwrap();
+        // A non-skill sibling inside the category must stay silent too.
+        std::fs::create_dir_all(temp_dir.path().join("cat").join("docs")).unwrap();
+
+        let mut store = SkillStore::new();
+        let errors = store.load_from_directory(temp_dir.path(), &limit_config(0));
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "the category must be charged once per skill, got {errors:?}"
+        );
+        assert_eq!(errors[0].path, nested);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn store_max_skills_limit_still_enforced_for_real_skills() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        for name in ["first", "second"] {
+            let dir = temp_dir.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let mut store = SkillStore::new();
+        let errors = store.load_from_directory(temp_dir.path(), &limit_config(1));
+
+        assert_eq!(store.len(), 1, "the first skill still loads");
+        assert_eq!(errors.len(), 1, "the second skill still errors");
+        assert!(errors[0].error.contains("max skills"));
     }
 }
