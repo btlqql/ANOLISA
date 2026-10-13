@@ -83,23 +83,29 @@ def update_config_file(path: Path, model: dict, judge: dict,
     """Update a single YAML config file with new model settings."""
     data = load_yaml(path)
 
+    existing_model = data.get("model")
     data["model"] = {
+        **(existing_model if isinstance(existing_model, dict) else {}),
         "api_key": model["api_key"],
         "base_url": model["base_url"],
         "model_id": model["model_id"],
         "input_modalities": ["text", "image"],
     }
 
+    existing_judge = data.get("judge")
     data["judge"] = {
+        **(existing_judge if isinstance(existing_judge, dict) else {}),
         "api_key": judge["api_key"],
         "base_url": judge["base_url"],
         "model_id": judge["model_id"],
-        "enabled": data.get("judge", {}).get("enabled", True),
+        "enabled": existing_judge.get("enabled", True) if isinstance(existing_judge, dict) else True,
     }
 
     if user_agent_model:
         if "user_agent_model" in data or path.name in ("config.yaml", "config_user_agent.yaml"):
+            existing_user_agent = data.get("user_agent_model")
             data["user_agent_model"] = {
+                **(existing_user_agent if isinstance(existing_user_agent, dict) else {}),
                 "api_key": user_agent_model["api_key"],
                 "base_url": user_agent_model["base_url"],
                 "model_id": user_agent_model["model_id"],
