@@ -117,7 +117,16 @@ def main():
         print(f"no such dir: {root}", file=sys.stderr)
         sys.exit(1)
 
-    runs = [root / args.run] if args.run else sorted(p for p in root.iterdir() if p.is_dir())
+    if args.run:
+        if args.run in (".", "..") or Path(args.run).name != args.run:
+            ap.error("--run must be a directory name directly under --root")
+        selected_run = root / args.run
+        if not selected_run.is_dir():
+            print(f"no such run dir: {selected_run}", file=sys.stderr)
+            return 1
+        runs = [selected_run]
+    else:
+        runs = sorted(p for p in root.iterdir() if p.is_dir())
 
     rows = []
     summary = {
@@ -134,6 +143,9 @@ def main():
     for run_dir in runs:
         pairs = find_pairs(run_dir)
         if not pairs:
+            if args.run:
+                print(f"no session traces found in run: {run_dir}", file=sys.stderr)
+                return 1
             continue
         for stem, sess, trace in pairs:
             summary["total_pairs"] += 1
@@ -219,6 +231,8 @@ def main():
                 ])
         print(f"\nCSV written: {args.csv}")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
