@@ -178,8 +178,19 @@ def ordered_unique(items):
 
 
 def merge_plugin_allow(existing, merged):
-    existing_allow = existing.get("plugins", {}).get("allow", [])
-    merged_allow = merged.get("plugins", {}).get("allow")
+    existing_plugins = existing.get("plugins", {})
+    if not isinstance(existing_plugins, dict):
+        raise SystemExit("Invalid OpenClaw config: plugins must be an object.")
+    existing_allow = existing_plugins.get("allow", [])
+    if not isinstance(existing_allow, list) or not all(
+        isinstance(item, str) for item in existing_allow
+    ):
+        raise SystemExit("Invalid OpenClaw config: plugins.allow must be a list of strings.")
+
+    merged_plugins = merged.get("plugins", {})
+    if not isinstance(merged_plugins, dict):
+        raise SystemExit("Invalid OpenClaw config: plugins must be an object.")
+    merged_allow = merged_plugins.get("allow")
     if merged_allow is None:
         return merged
 
