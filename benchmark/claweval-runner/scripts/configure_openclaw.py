@@ -30,6 +30,7 @@ Sets:
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
@@ -132,9 +133,19 @@ def main() -> None:
     else:
         changes.append(f"  gateway.port: {old_port} (already configured)")
 
-    # Write back
-    with open(OPENCLAW_CONFIG, "w") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    # Finish the replacement file before touching the existing config.
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{OPENCLAW_CONFIG.name}.",
+        suffix=".tmp",
+        dir=OPENCLAW_CONFIG.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        os.replace(temp_name, OPENCLAW_CONFIG)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
     print(f"Updated {OPENCLAW_CONFIG}:")
     for c in changes:
